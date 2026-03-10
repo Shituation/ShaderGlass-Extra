@@ -17,6 +17,7 @@ This fork adds saving the size of the shader window and its position on profiles
   * import of external .slangp/.slang shaders
   * high customizability with various options, operating modes and shader parameters
   * can be captured by OBS (using Game Capture source)
+  * saving window size and position on profiles for easy load <-- This fork🤓
 
 Check out [Online Manual](https://mausimus.github.io/ShaderGlass/MANUAL.html)
 
@@ -39,16 +40,24 @@ Click to view on YouTube
 
 <br/>
 
-### Code
+### Why this?
 
-Built using Visual Studio 2022 using ISO C++ 20, Windows SDK 10.0.26100, Windows Capture API and DirectX 11.
+There are 2 reasons I made this fork: 
 
-ShaderGlass includes a limited implementation of RetroArch shader back-end using DirectX 11.
-[ShaderGen](ShaderGen) is a command-line tool for converting Slang shaders 
-into .h files which can be precompiled in ShaderGlass. The conversion process relies on:
-1. [glslang](https://github.com/KhronosGroup/glslang) for converting Slang/GLSL shaders to SPIR-V
-2. [SPIR-V cross-compiler](https://github.com/KhronosGroup/SPIRV-Cross) for converting those to HLSL (DX11 format)
-3. [Direct3D Shader Compiler (fxc.exe)](https://developer.microsoft.com/en-us/windows/downloads/windows-10-sdk/) for pre-compiling into bytecode
+1- Games running on SDL have a terrible time with dll injection. Playing mods for old games like Augustus or KeeperFX with 
+shader effects would be impossible.
+
+2- The original app had limitations with profiles not saving the states of the window of the app, meaning that for using it
+you had to launch the game, then launch ShaderGlass, then load the profile for the app you want, then move the window in place, then resize its window to fit the game.
+
+Magpie and other shader apps, are fine but they always lack something. Magpie is hardcoded to upscale the game window no matter what. I saw potential in this app, since it can bypass the DLL injection drama like Magpie but also respected the orignal window size of games (I play on windowed mode always on a big screen). I felt frustrated because it was always so close to being good enough but these apps always lacked something. As said, in this case it was a little tiresome to have to manually set it up everytime I wanted to use the CRT shaders. So I came up with the idea of saving those parameters into the profile files instead of overwriting those options in windows registry. And it turned out to work as I wanted. This fork comes to fill a small gap.
+
+<br/>
+
+> [!IMPORTANT]
+> All modifications are made with LLM's as I am not a developer.
+> 
+> Some people may feel this is bad so I'm warning you just in case.
 
 <br/>
 
