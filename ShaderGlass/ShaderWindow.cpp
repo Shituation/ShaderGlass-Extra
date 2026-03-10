@@ -6,3039 +6,1230 @@ GNU General Public License v3.0
 */
 
 #include "pch.h"
-
-#include "resource.h"
-#include "ShaderWindow.h"
-#include "ShaderGC.h"
+#include "ShaderGlass.h"
+#include "ShaderList.h"
 #include "CursorEmulator.h"
+#include "resource.h"
 
-#include "Shlobj.h"
+static HRESULT     hr;
+static const float background_colour[4] = {0, 0, 0, 1.0f};
 
-#define TIMER_TITLE 0
-
-ShaderWindow::ShaderWindow(CaptureManager& captureManager) :
-    m_captureManager(captureManager), m_captureOptions(captureManager.m_options), m_title(), m_windowClass(), m_toggledNone(false)
+ShaderGlass::ShaderGlass(CursorEmulator& cursorEmulator) :
+    m_lastSize {}, m_lastPos {}, m_lastCaptureWindowPos {}, m_lastCaptureWindowSize {}, m_passthroughDef(), m_shaderPreset(new Preset(m_passthroughDef)),
+    m_preprocessShader(m_preprocessShaderDef), m_preprocessPreset(m_preprocessPresetDef), m_preprocessPass(m_preprocessShader, m_preprocessPreset, true),
+    m_cursorEmulator(cursorEmulator)
 { }
 
-bool ShaderWindow::LoadProfile(const std::wstring& fileName, bool forceStart)
+ShaderGlass::~ShaderGlass()
 {
-    try
-    {
-        bool paused = m_captureManager.IsActive();
-        if(paused)
-            Stop();
+    std::unique_lock lock(m_mutex);
 
-        m_captureManager.ForgetLastPreset();
+    DestroyShaders();
+    DestroyPasses();
+    DestroyTargets();
 
-        std::ifstream infile(fileName);
-        if(!infile.good())
-        {
-            auto message = std::wstring(TEXT("Unable to find profile ")) + fileName;
-            MessageBox(NULL, message.data(), L"ShaderGlass", MB_OK | MB_ICONERROR);
-
-            return false;
-        }
-
-        std::string                                       shaderCategory;
-        std::string                                       shaderName;
-        std::optional<std::wstring>                       shaderPath;
-        std::optional<std::wstring>                       windowName;
-        std::optional<std::wstring>                       deviceName;
-        std::optional<std::string>                        deviceFormat;
-        std::optional<std::string>                        desktopName;
-        std::optional<bool>                               transparent;
-        std::optional<bool>                               clone;
-        std::vector<std::tuple<int, std::string, double>> params;
-        bool                                              isImport = false;
-        while(!infile.eof())
-        {
-            std::string key;
-            std::string value;
-            infile >> key;
-            infile >> std::quoted(value);
-            if(key == "ProfileVersion")
-            {
-                if(!value.starts_with("1."))
-                    return true;
-            }
-            else if(key == "CaptureWindow")
-            {
-                wchar_t wideName[MAX_WINDOW_TITLE];
-                MultiByteToWideChar(CP_UTF8, 0, value.c_str(), -1, wideName, MAX_WINDOW_TITLE);
-                windowName = std::wstring(wideName);
-            }
-            else if(key == "CaptureDevice")
-            {
-                wchar_t wideName[MAX_DEVICE_NAME];
-                MultiByteToWideChar(CP_UTF8, 0, value.c_str(), -1, wideName, MAX_DEVICE_NAME);
-                deviceName = std::wstring(wideName);
-            }
-            else if(key == "CaptureFormat")
-            {
-                deviceFormat = value;
-            }
-            else if(key == "CaptureDesktop")
-            {
-                desktopName = value;
-            }
-            else if(key == "PixelSize")
-            {
-                for(const auto& p : pixelSizes)
-                {
-                    if(value == p.second.mnemonic)
-                        SendMessage(m_mainWindow, WM_COMMAND, p.first, 0);
-                }
-            }
-            else if(key == "DPIScaling")
-            {
-                if(value == "1")
-                {
-                    m_captureOptions.dpiScale = m_dpiScale;
-                    CheckMenuItem(m_pixelSizeMenu, IDM_PIXELSIZE_DPI, MF_CHECKED | MF_BYCOMMAND);
-                }
-                else
-                {
-                    m_captureOptions.dpiScale = 1.0f;
-                    CheckMenuItem(m_pixelSizeMenu, IDM_PIXELSIZE_DPI, MF_UNCHECKED | MF_BYCOMMAND);
-                }
-            }
-            else if(key == "AspectRatio")
-            {
-                bool found = false;
-                for(const auto& p : aspectRatios)
-                {
-                    if(value == p.second.mnemonic)
-                    {
-                        SendMessage(m_mainWindow, WM_COMMAND, p.first, 0);
-                        found = true;
-                    }
-                }
-                if(!found)
-                {
-                    // set as custom
-                    try
-                    {
-                        float customValue = std::stof(value);
-                        if(customValue != 0 && !std::isnan(customValue))
-                            SendMessage(m_mainWindow, WM_COMMAND, aspectRatios.rbegin()->first, (LPARAM)(customValue * CUSTOM_PARAM_SCALE));
-                    }
-                    catch(std::exception&)
-                    {
-                        // ignored
-                    }
-                }
-            }
-            else if(key == "ShaderCategory")
-            {
-                shaderCategory = value;
-            }
-            else if(key == "ShaderName")
-            {
-                shaderName = value;
-            }
-            else if(key == "ShaderPath")
-            {
-                wchar_t wideName[MAX_PATH];
-                MultiByteToWideChar(CP_UTF8, 0, value.c_str(), -1, wideName, MAX_PATH);
-                shaderPath = std::wstring(wideName);
-            }
-            else if(key == "FrameSkip" && !RememberFPS())
-            {
-                for(const auto& p : frameSkips)
-                {
-                    if(value == p.second.mnemonic)
-                        SendMessage(m_mainWindow, WM_COMMAND, p.first, 0);
-                }
-            }
-            else if(key == "OutputScale")
-            {
-                if(value == "Free")
-                {
-                    CheckMenuRadioItem(m_outputScaleMenu, WM_OUTPUT_SCALE(0), WM_OUTPUT_SCALE(static_cast<UINT>(outputScales.size() - 1)), 0, MF_BYCOMMAND);
-                    CheckMenuItem(m_outputScaleMenu, IDM_OUTPUT_FREESCALE, MF_CHECKED | MF_BYCOMMAND);
-                    m_captureOptions.freeScale   = true;
-                    m_captureOptions.outputScale = 1.0f;
-                }
-                else
-                {
-                    CheckMenuItem(m_outputScaleMenu, IDM_OUTPUT_FREESCALE, MF_UNCHECKED | MF_BYCOMMAND);
-                    m_captureOptions.freeScale = false;
-                    for(const auto& p : outputScales)
-                    {
-                        if(value == p.second.mnemonic)
-                            SendMessage(m_mainWindow, WM_COMMAND, p.first, 0);
-                    }
-                }
-            }
-            else if(key == "FlipH")
-            {
-                m_captureOptions.flipHorizontal = (value == "1");
-                if(m_captureOptions.flipHorizontal)
-                    CheckMenuItem(m_flipMenu, IDM_FLIP_HORIZONTAL, MF_CHECKED | MF_BYCOMMAND);
-                else
-                    CheckMenuItem(m_flipMenu, IDM_FLIP_HORIZONTAL, MF_UNCHECKED | MF_BYCOMMAND);
-            }
-            else if(key == "FlipV")
-            {
-                m_captureOptions.flipVertical = (value == "1");
-                if(m_captureOptions.flipVertical)
-                    CheckMenuItem(m_flipMenu, IDM_FLIP_VERTICAL, MF_CHECKED | MF_BYCOMMAND);
-                else
-                    CheckMenuItem(m_flipMenu, IDM_FLIP_VERTICAL, MF_UNCHECKED | MF_BYCOMMAND);
-            }
-            else if(key == "Vertical")
-            {
-                m_captureOptions.vertical = (value == "1");
-                CheckMenuItem(m_orientationMenu, ID_ORIENTATION_HORIZONTAL, (m_captureOptions.vertical ? MF_UNCHECKED : MF_CHECKED) | MF_BYCOMMAND);
-                CheckMenuItem(m_orientationMenu, ID_ORIENTATION_VERTICAL, (m_captureOptions.vertical ? MF_CHECKED : MF_UNCHECKED) | MF_BYCOMMAND);
-            }
-            else if(key == "Clone")
-            {
-                clone = (value == "1");
-            }
-            else if(key == "Transparent")
-            {
-                transparent = (value == "1");
-            }
-            else if(key == "ScaleLocked")
-            {
-                if(value == "1")
-                    CheckMenuItem(m_outputScaleMenu, IDM_OUTPUT_LOCKSCALE, MF_CHECKED | MF_BYCOMMAND);
-                else
-                    CheckMenuItem(m_outputScaleMenu, IDM_OUTPUT_LOCKSCALE, MF_UNCHECKED | MF_BYCOMMAND);
-            }
-            else if(key == "CaptureCursor" && HasCaptureAPI())
-            {
-                m_captureOptions.captureCursor = (value == "1");
-                if(m_captureOptions.captureCursor)
-                    CheckMenuItem(m_inputMenu, IDM_INPUT_CAPTURECURSOR, MF_CHECKED | MF_BYCOMMAND);
-                else
-                    CheckMenuItem(m_inputMenu, IDM_INPUT_CAPTURECURSOR, MF_UNCHECKED | MF_BYCOMMAND);
-            }
-            else if(key == "InputArea")
-            {
-                std::istringstream iss(value);
-                iss >> m_captureOptions.inputArea.left;
-                iss >> m_captureOptions.inputArea.top;
-                iss >> m_captureOptions.inputArea.right;
-                iss >> m_captureOptions.inputArea.bottom;
-                if(m_captureOptions.inputArea.right - m_captureOptions.inputArea.left != 0)
-                    CheckMenuItem(m_displayMenu, ID_DESKTOP_LOCKINPUTAREA, MF_CHECKED | MF_BYCOMMAND);
-                else
-                    CheckMenuItem(m_displayMenu, ID_DESKTOP_LOCKINPUTAREA, MF_UNCHECKED | MF_BYCOMMAND);
-            }
-            else if(key == "CroppedArea")
-            {
-                std::istringstream iss(value);
-                iss >> m_captureOptions.croppedArea.left;
-                iss >> m_captureOptions.croppedArea.top;
-                iss >> m_captureOptions.croppedArea.right;
-                iss >> m_captureOptions.croppedArea.bottom;
-            }
-            else if(key.starts_with("Param-") && key.size() >= 9)
-            {
-                try
-                {
-                    size_t start = 6;
-                    size_t split = key.find('-', start);
-                    if(split == key.npos || split == key.size() - 1 || split == start)
-                        continue;
-
-                    auto passNo = std::stoi(key.substr(start, split - start));
-                    auto name   = key.substr(split + 1);
-                    params.push_back(std::make_tuple(passNo, name, std::stod(value)));
-                }
-                catch(std::exception&)
-                {
-                    // ignored
-                }
-            }
-        }
-        infile.close();
-
-        // try to find shader
-        if(shaderPath.has_value() && !shaderPath.value().empty())
-        {
-            ImportShader(shaderPath.value(), paused || forceStart);
-            isImport = true;
-        }
-        else if(shaderName.size())
-        {
-            const auto& presets = m_captureManager.Presets();
-            for(unsigned i = 0; i < presets.size(); i++)
-            {
-                if(presets.at(i)->Category == shaderCategory && presets.at(i)->Name == shaderName)
-                {
-                    SendMessage(m_mainWindow, WM_COMMAND, WM_SHADER(i), 0);
-                    break;
-                }
-            }
-        }
-
-        if(deviceName.has_value() && deviceName.value().size() && deviceFormat.has_value() && deviceFormat.value().size())
-        {
-            auto devices = m_captureManager.CaptureDevices();
-            for(const auto& d : devices)
-                for(const auto& f : d.formats)
-                    if(d.name == deviceName && f.id == deviceFormat)
-                        SendMessage(m_mainWindow, WM_COMMAND, WM_CAPTURE_DEVICE_FORMAT(f.deviceFormatNo), 1);
-        }
-        else if(windowName.has_value() && windowName.value().size())
-        {
-            ScanWindows();
-            for(unsigned i = 0; i < m_captureWindows.size(); i++)
-            {
-                if(m_captureWindows.at(i).name == windowName.value())
-                {
-                    SendMessage(m_mainWindow, WM_COMMAND, WM_CAPTURE_WINDOW(i), 0);
-                    break;
-                }
-            }
-        }
-        else if(desktopName.has_value() && desktopName.value().size())
-        {
-            for(unsigned i = 0; i < m_captureDisplays.size(); i++)
-            {
-                if(m_captureDisplays.at(i).name == desktopName.value())
-                {
-                    SendMessage(m_mainWindow, WM_COMMAND, WM_CAPTURE_DISPLAY(i), 0);
-                    break;
-                }
-            }
-        }
-
-        // only now set IO modes to override defaults
-        if(clone.has_value())
-        {
-            m_captureOptions.clone = clone.value();
-            if(m_captureOptions.clone)
-            {
-                CheckMenuItem(m_modeMenu, IDM_MODE_CLONE, MF_CHECKED | MF_BYCOMMAND);
-                CheckMenuItem(m_modeMenu, IDM_MODE_GLASS, MF_UNCHECKED | MF_BYCOMMAND);
-            }
-            else
-            {
-                CheckMenuItem(m_modeMenu, IDM_MODE_CLONE, MF_UNCHECKED | MF_BYCOMMAND);
-                CheckMenuItem(m_modeMenu, IDM_MODE_GLASS, MF_CHECKED | MF_BYCOMMAND);
-            }
-        }
-
-        if(transparent.has_value())
-        {
-            m_captureOptions.transparent = transparent.value();
-            if(m_captureOptions.transparent)
-            {
-                CheckMenuItem(m_outputWindowMenu, IDM_WINDOW_TRANSPARENT, MF_CHECKED | MF_BYCOMMAND);
-                CheckMenuItem(m_outputWindowMenu, IDM_WINDOW_SOLID, MF_UNCHECKED | MF_BYCOMMAND);
-            }
-            else
-            {
-                CheckMenuItem(m_outputWindowMenu, IDM_WINDOW_TRANSPARENT, MF_UNCHECKED | MF_BYCOMMAND);
-                CheckMenuItem(m_outputWindowMenu, IDM_WINDOW_SOLID, MF_CHECKED | MF_BYCOMMAND);
-            }
-        }
-
-        // load any parameters
-        if(params.size())
-        {
-            m_captureManager.SetParams(params);
-        }
-
-        if(paused && !isImport)
-            SendMessage(m_mainWindow, WM_COMMAND, IDM_START, 0);
-
-        AddRecentProfile(fileName);
-    }
-    catch(std::exception& e)
-    {
-        MessageBox(NULL, convertCharArrayToLPCWSTR((std::string("Error loading profile: ") + std::string(e.what())).c_str()), L"ShaderGlass", MB_OK | MB_ICONERROR);
-    }
-
-    return true;
+    m_context->Flush();
 }
 
-void ShaderWindow::StartDialog()
+void ShaderGlass::Initialize(HWND                                outputWindow,
+                             HWND                                captureWindow,
+                             HMONITOR                            captureMonitor,
+                             bool                                clone,
+                             bool                                image,
+                             bool                                flipMode,
+                             bool                                allowTearing,
+                             bool                                useHDR,
+                             winrt::com_ptr<ID3D11Device>        device,
+                             winrt::com_ptr<ID3D11DeviceContext> context)
 {
-    m_inDialog = true;
-    UpdateWindowState();
-}
+    m_outputWindow  = outputWindow;
+    m_captureWindow = captureWindow;
+    m_clone         = clone;
+    m_image         = image;
+    m_flipMode      = flipMode;
+    m_allowTearing  = allowTearing;
+    m_useHDR        = useHDR;
+    m_device        = device;
+    m_context       = context;
 
-void ShaderWindow::EndDialog()
-{
-    m_inDialog = false;
-    UpdateWindowState();
-}
-
-void ShaderWindow::LoadProfile()
-{
-    OPENFILENAMEW ofn;
-    wchar_t       szFileName[MAX_PATH] = L"";
-    ZeroMemory(&ofn, sizeof(ofn));
-    ofn.lStructSize = sizeof(ofn);
-    ofn.hwndOwner   = NULL;
-    ofn.lpstrFilter = (LPCWSTR)L"ShaderGlass Profiles (*.sgp)\0*.sgp\0All Files (*.*)\0*.*\0";
-    ofn.lpstrFile   = (LPWSTR)szFileName;
-    ofn.nMaxFile    = MAX_PATH;
-    ofn.Flags       = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_HIDEREADONLY;
-    ofn.lpstrDefExt = (LPCWSTR)L"sgp";
-
-    StartDialog();
-    if(GetOpenFileName(&ofn))
+    if(captureMonitor && !clone)
     {
-        std::wstring ws(ofn.lpstrFile);
-        LoadProfile(ws);
+        MONITORINFO monitorInfo;
+        monitorInfo.cbSize = sizeof(MONITORINFO);
+        GetMonitorInfo(captureMonitor, &monitorInfo);
+        m_monitorOffset.x = monitorInfo.rcMonitor.left;
+        m_monitorOffset.y = monitorInfo.rcMonitor.top;
     }
-    EndDialog();
-}
-
-void ShaderWindow::ImportShader()
-{
-    OPENFILENAMEW ofn;
-    wchar_t       szFileName[MAX_PATH] = L"";
-    ZeroMemory(&ofn, sizeof(ofn));
-    ofn.lStructSize = sizeof(ofn);
-    ofn.hwndOwner   = NULL;
-    ofn.lpstrFilter =
-        (LPCWSTR)L"Slang Profiles or Shaders (*.slangp;*.slang)\0*.slangp;*.slang\0Slang Profiles (*.slangp)\0*.slangp\0Slang Shaders (*.slang)\0*.slang\0All Files (*.*)\0*.*\0";
-    ofn.lpstrFile   = (LPWSTR)szFileName;
-    ofn.nMaxFile    = MAX_PATH;
-    ofn.Flags       = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_HIDEREADONLY;
-    ofn.lpstrDefExt = (LPCWSTR)L"slangp";
-
-    StartDialog();
-    if(GetOpenFileName(&ofn))
+    else if(!captureWindow && !captureMonitor && !clone)
     {
-        std::wstring ws(ofn.lpstrFile);
-        ImportShader(ws, false);
-    }
-    EndDialog();
-}
-
-void ShaderWindow::SetFreeScale()
-{
-    if(!ScaleLocked())
-    {
-        CheckMenuRadioItem(m_outputScaleMenu, WM_OUTPUT_SCALE(0), WM_OUTPUT_SCALE(static_cast<UINT>(outputScales.size() - 1)), 0, MF_BYCOMMAND);
-        CheckMenuItem(m_outputScaleMenu, IDM_OUTPUT_FREESCALE, MF_CHECKED | MF_BYCOMMAND);
-        m_captureOptions.freeScale = true;
-    }
-    m_captureManager.UpdateOutputSize();
-}
-
-void ShaderWindow::LoadInputImage()
-{
-    OPENFILENAMEW ofn;
-    wchar_t       szFileName[MAX_PATH] = L"";
-    ZeroMemory(&ofn, sizeof(ofn));
-    ofn.lStructSize = sizeof(ofn);
-    ofn.hwndOwner   = NULL;
-    ofn.lpstrFilter = (LPCWSTR)L"Images (*.png;*.jpg,*.gif)\0*.png;*.jpg;*.gif\0All Files (*.*)\0*.*\0";
-    ofn.lpstrFile   = (LPWSTR)szFileName;
-    ofn.nMaxFile    = MAX_PATH;
-    ofn.Flags       = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_HIDEREADONLY;
-    ofn.lpstrDefExt = (LPCWSTR)L"png";
-
-    StartDialog();
-    if(GetOpenFileName(&ofn))
-    {
-        std::wstring ws(ofn.lpstrFile);
-        m_captureOptions.imageFile      = ws;
-        m_captureOptions.deviceFormatNo = 0;
-
-        auto prevState   = CheckMenuItem(m_inputMenu, ID_INPUT_FILE, MF_CHECKED | MF_BYCOMMAND);
-        auto setDefaults = prevState != MF_CHECKED;
-
-        StartImage(setDefaults, setDefaults ? WM_PIXEL_SIZE(0) : 0);
-    }
-    EndDialog();
-}
-
-void ShaderWindow::StartImage(bool autoScale, int pixelSize)
-{
-    m_captureOptions.captureWindow = NULL;
-    m_captureOptions.monitor       = NULL;
-
-    // update input checkboxes
-    CheckMenuRadioItem(m_windowMenu, WM_CAPTURE_WINDOW(0), WM_CAPTURE_WINDOW(static_cast<UINT>(m_captureWindows.size())), 0, MF_BYCOMMAND);
-    CheckMenuRadioItem(m_displayMenu, WM_CAPTURE_DISPLAY(0), WM_CAPTURE_DISPLAY(static_cast<UINT>(m_captureDisplays.size())), 0, MF_BYCOMMAND);
-
-    // default to solid clone
-    m_captureOptions.clone = true;
-    CheckMenuItem(m_modeMenu, IDM_MODE_GLASS, MF_UNCHECKED | MF_BYCOMMAND);
-    CheckMenuItem(m_modeMenu, IDM_MODE_CLONE, MF_CHECKED | MF_BYCOMMAND);
-    m_captureOptions.transparent = false;
-    CheckMenuItem(m_outputWindowMenu, IDM_WINDOW_TRANSPARENT, MF_UNCHECKED | MF_BYCOMMAND);
-    CheckMenuItem(m_outputWindowMenu, IDM_WINDOW_SOLID, MF_CHECKED | MF_BYCOMMAND);
-    TryUpdateInput();
-    EnableMenuItem(m_outputScaleMenu, IDM_OUTPUT_FREESCALE, MF_BYCOMMAND | MF_ENABLED);
-    EnableMenuItem(m_inputMenu, ID_WINDOW_CROP, MF_BYCOMMAND | MF_ENABLED);
-
-    // if we are *switching* to file mode, default pixel size and freescale
-    if(autoScale && !ScaleLocked())
-    {
-        // set starting scale to fit within current window size
-        RECT r;
-        GetClientRect(m_mainWindow, &r);
-        int defaultScale = 1;
-        if(m_captureOptions.imageWidth > 0 && m_captureOptions.imageHeight > 0)
-        {
-            defaultScale = max(1, min(r.right / m_captureOptions.imageWidth, r.bottom / m_captureOptions.imageHeight));
-        }
-
-        m_captureOptions.outputScale = (float)defaultScale;
-        SetFreeScale();
-    }
-    if(pixelSize)
-    {
-        SendMessage(m_mainWindow, WM_COMMAND, pixelSize, 0);
-    }
-
-    if(!HasCaptureAPI() && !m_captureManager.IsActive())
-    {
-        Start();
-    }
-
-    UpdateWindowState();
-}
-
-void ShaderWindow::SaveProfile(const std::wstring& fileName)
-{
-    const auto& pixelSize   = pixelSizes.at(WM_PIXEL_SIZE(m_selectedPixelSize));
-    const auto& outputScale = outputScales.at(WM_OUTPUT_SCALE(m_selectedOutputScale));
-    const auto& aspectRatio = aspectRatios.at(WM_ASPECT_RATIO(m_selectedAspectRatio));
-    const auto& frameSkip   = frameSkips.at(WM_FRAME_SKIP(m_selectedFrameSkip));
-    const auto& shader      = m_captureManager.Presets().at(m_captureOptions.presetNo);
-
-    std::ofstream outfile(fileName);
-    outfile << "ProfileVersion " << std::quoted("1.1") << std::endl;
-    outfile << "PixelSize " << std::quoted(pixelSize.mnemonic) << std::endl;
-    outfile << "DPIScaling " << std::quoted(std::to_string(m_captureOptions.dpiScale != 1.0f)) << std::endl;
-    if(aspectRatio.mnemonic == CUSTOM_MNEMONIC)
-        outfile << "AspectRatio " << std::quoted(std::to_string(aspectRatio.r)) << std::endl;
-    else
-        outfile << "AspectRatio " << std::quoted(aspectRatio.mnemonic) << std::endl;
-    if(shader->Category == "Imported")
-    {
-        char utfName[MAX_PATH * 4];
-        WideCharToMultiByte(CP_UTF8, 0, shader->ImportPath.c_str(), -1, utfName, MAX_PATH * 4, NULL, NULL);
-        outfile << "ShaderPath " << std::quoted(utfName) << std::endl;
+        // All Desktops glass
+        m_monitorOffset.x = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        m_monitorOffset.y = GetSystemMetrics(SM_YVIRTUALSCREEN);
     }
     else
     {
-        outfile << "ShaderCategory " << std::quoted(shader->Category) << std::endl;
-        outfile << "ShaderName " << std::quoted(shader->Name) << std::endl;
+        m_monitorOffset.x = 0;
+        m_monitorOffset.y = 0;
     }
-    outfile << "FrameSkip " << std::quoted(frameSkip.mnemonic) << std::endl;
-    outfile << "OutputScale " << std::quoted(m_captureOptions.freeScale ? "Free" : outputScale.mnemonic) << std::endl;
-    outfile << "FlipH " << std::quoted(std::to_string(m_captureOptions.flipHorizontal)) << std::endl;
-    outfile << "FlipV " << std::quoted(std::to_string(m_captureOptions.flipVertical)) << std::endl;
-    outfile << "Vertical " << std::quoted(std::to_string(m_captureOptions.vertical)) << std::endl;
-    outfile << "Clone " << std::quoted(std::to_string(m_captureOptions.clone)) << std::endl;
-    outfile << "CaptureCursor " << std::quoted(std::to_string(m_captureOptions.captureCursor)) << std::endl;
-    outfile << "Transparent " << std::quoted(std::to_string(m_captureOptions.transparent)) << std::endl;
-    outfile << "ScaleLocked " << std::quoted(std::to_string(ScaleLocked())) << std::endl;
-    outfile << "InputArea \"" << std::to_string(m_captureOptions.inputArea.left) << " " << std::to_string(m_captureOptions.inputArea.top) << " "
-            << std::to_string(m_captureOptions.inputArea.right) << " " << std::to_string(m_captureOptions.inputArea.bottom) << "\"" << std::endl;
-    if(m_captureOptions.deviceFormatNo)
-    {
-        std::vector<CaptureDevice>::const_iterator di;
-        std::vector<CaptureFormat>::const_iterator fi;
-        if(m_captureManager.FindDeviceFormat(m_captureOptions.deviceFormatNo, di, fi))
-        {
-            char buf[MAX_DEVICE_NAME];
-            WideCharToMultiByte(CP_UTF8, 0, di->name.c_str(), -1, buf, MAX_DEVICE_NAME, NULL, NULL);
-            outfile << "CaptureDevice " << std::quoted(buf) << std::endl;
-            outfile << "CaptureFormat " << std::quoted(fi->id) << std::endl;
-        }
-    }
-    else if(m_captureOptions.captureWindow && m_captureOptions.captureWindow != HWND_BROADCAST)
-    {
-        const auto& crop = m_captureOptions.croppedArea;
-        outfile << "CroppedArea \"" << std::to_string(crop.left) << " " << std::to_string(crop.top) << " " << std::to_string(crop.right) << " " << std::to_string(crop.bottom)
-                << "\"" << std::endl;
 
-        auto windowTitle = GetWindowStringText(m_captureOptions.captureWindow);
-        char utfName[MAX_WINDOW_TITLE];
-        WideCharToMultiByte(CP_UTF8, 0, windowTitle.c_str(), -1, utfName, MAX_WINDOW_TITLE, NULL, NULL);
-        outfile << "CaptureWindow " << std::quoted(utfName) << std::endl;
-    }
-    else if(m_captureOptions.monitor)
-    {
-        MONITORINFOEX info;
-        info.cbSize = sizeof(info);
-        GetMonitorInfo(m_captureOptions.monitor, &info);
-        char utfName[MAX_WINDOW_TITLE];
-        WideCharToMultiByte(CP_UTF8, 0, info.szDevice, -1, utfName, MAX_WINDOW_TITLE, NULL, NULL);
-        outfile << "CaptureDesktop " << std::quoted(utfName) << std::endl;
-    }
-    for(const auto& pt : m_captureManager.Params())
-    {
-        const auto& s = std::get<0>(pt);
-        const auto& p = std::get<1>(pt);
-        if(p->currentValue != m_captureManager.GetDefaultValue(p))
-        {
-            outfile << "Param-" << s << "-" << p->name << " " << std::quoted(std::to_string(p->currentValue)) << std::endl;
-        }
-    }
-    outfile.close();
+    // remember initial size
+    m_lastPos.x = 0;
+    m_lastPos.y = 0;
+    RECT clientRect;
+    GetClientRect(m_outputWindow, &clientRect);
+    m_lastSize.x = clientRect.right;
+    m_lastSize.y = clientRect.bottom;
 
-    AddRecentProfile(fileName);
+    m_prevTicks          = GetTickCount64();
+    m_startTicks         = GetTickCount64();
+    m_prevLogicalFrameNo = 0;
+
+    // create swapchain
+    {
+        winrt::com_ptr<IDXGIFactory2> dxgiFactory;
+        {
+            winrt::com_ptr<IDXGIDevice1> dxgiDevice;
+            hr = m_device->QueryInterface(__uuidof(IDXGIDevice1), (void**)dxgiDevice.put());
+            assert(SUCCEEDED(hr));
+
+            winrt::com_ptr<IDXGIAdapter> dxgiAdapter;
+            hr = dxgiDevice->GetAdapter(dxgiAdapter.put());
+            assert(SUCCEEDED(hr));
+
+            hr = dxgiAdapter->GetParent(__uuidof(IDXGIFactory2), (void**)dxgiFactory.put());
+            assert(SUCCEEDED(hr));
+        }
+
+        DXGI_SWAP_CHAIN_DESC1 d3d11SwapChainDesc = {};
+        d3d11SwapChainDesc.Width                 = 0;
+        d3d11SwapChainDesc.Height                = 0;
+        d3d11SwapChainDesc.Format                = m_useHDR ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_B8G8R8A8_UNORM;
+        d3d11SwapChainDesc.SampleDesc.Count      = 1;
+        d3d11SwapChainDesc.SampleDesc.Quality    = 0;
+        d3d11SwapChainDesc.BufferUsage           = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        d3d11SwapChainDesc.BufferCount           = 3;
+        // flip mode has a weird bug on Win 10 where the first frame doesn't align with the window client area, until window is moved :(
+        if(m_flipMode)
+        {
+            d3d11SwapChainDesc.Scaling    = DXGI_SCALING_NONE;
+            d3d11SwapChainDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        }
+        else
+        {
+            d3d11SwapChainDesc.Scaling    = DXGI_SCALING_STRETCH;
+            d3d11SwapChainDesc.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+        }
+        d3d11SwapChainDesc.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
+        if(m_flipMode && m_allowTearing)
+        {
+            d3d11SwapChainDesc.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+        }
+        else
+        {
+            d3d11SwapChainDesc.Flags = 0;
+        }
+
+        hr = dxgiFactory->CreateSwapChainForHwnd(m_device.get(), m_outputWindow, &d3d11SwapChainDesc, 0, 0, m_swapChain.put());
+        assert(SUCCEEDED(hr));
+    }
+
+    hr = m_swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)m_displayTexture.put());
+    assert(SUCCEEDED(hr));
+    if(!m_displayTexture)
+        throw std::exception("Unable to create framebuffer");
+
+    m_device->CreateRenderTargetView(m_displayTexture.get(), 0, m_displayRenderTarget.put());
+
+    D3D11_RASTERIZER_DESC desc = {};
+    desc.CullMode              = D3D11_CULL_NONE;
+    desc.FillMode              = D3D11_FILL_SOLID;
+    desc.DepthClipEnable       = FALSE;
+    desc.MultisampleEnable     = FALSE;
+    hr                         = m_device->CreateRasterizerState(&desc, m_rasterizerState.put());
+    assert(SUCCEEDED(hr));
+
+    if(m_useHDR)
+    {
+        hr = m_swapChain->QueryInterface(__uuidof(IDXGISwapChain3), reinterpret_cast<void**>(m_swapChain3.put()));
+        assert(SUCCEEDED(hr));
+
+        SetSwapchainColorSpace();
+    }
+
+    m_context->RSSetState(m_rasterizerState.get());
+
+    m_preprocessShader.Create(m_device);
+    m_preprocessPass.Initialize(m_device, m_context);
+    RebuildShaders();
+
+    m_running = true;
 }
 
-void ShaderWindow::SaveProfile()
+void ShaderGlass::RebuildShaders()
 {
-    OPENFILENAMEW ofn;
-    wchar_t       szFileName[MAX_PATH] = L"";
-    ZeroMemory(&ofn, sizeof(ofn));
-    ofn.lStructSize = sizeof(ofn);
-    ofn.hwndOwner   = NULL;
-    ofn.lpstrFilter = (LPCWSTR)L"ShaderGlass Profiles (*.sgp)\0*.sgp\0All Files (*.*)\0*.*\0";
-    ofn.lpstrFile   = (LPWSTR)szFileName;
-    ofn.nMaxFile    = MAX_PATH;
-    ofn.Flags       = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_HIDEREADONLY;
-    ofn.lpstrDefExt = (LPCWSTR)L"sgp";
-
-    StartDialog();
-    if(GetSaveFileName(&ofn))
+    m_shaderPreset->Create(m_device);
+    m_shaderPasses.reserve(m_shaderPreset->m_shaders.size() + (m_vertical ? 1 : 0));
+    for(auto& shader : m_shaderPreset->m_shaders)
     {
-        std::wstring ws(ofn.lpstrFile);
-        SaveProfile(ws);
+        m_shaderPasses.emplace_back(shader, *m_shaderPreset, m_device, m_context);
     }
-    EndDialog();
-}
-
-DWORD WINAPI CompileThreadFuncProxy(LPVOID lpParam)
-{
-    ((ShaderWindow*)lpParam)->CompileThreadFunc();
-    return 0;
-}
-
-// shader compiler needs to reuse thread
-void ShaderWindow::CompileThreadFunc()
-{
-    const ShaderCache& cache = m_captureManager.Cache();
-
-    while(true)
+    if(m_vertical)
     {
-        WaitForSingleObject(m_compileEvent, INFINITE);
-        ResetEvent(m_compileEvent);
+        m_shaderPasses.emplace_back(m_preprocessShader, m_preprocessPreset, m_device, m_context);
+    }
+    float vertical = m_vertical ? 1.0f : 0.0f;
+    m_preprocessShader.SetParam("SGVertical", &vertical);
 
-        if(m_importPath.empty())
-            continue;
+    m_presetTextures.clear();
+    for(auto& texture : m_shaderPreset->m_textures)
+    {
+        m_presetTextures.insert(make_pair(texture.second.m_name, texture.second.m_textureView));
+    }
 
-        std::string errorMsg;
-        try
-        {
-            std::ofstream log;
-            bool          warn;
-            auto          preset = ShaderGC::CompilePreset(m_importPath, log, warn, cache);
-            if(preset == nullptr)
-                throw std::runtime_error("Internal error");
-            auto id      = m_captureManager.AddPreset(preset);
-            m_numPresets = (unsigned int)m_captureManager.Presets().size();
-            SendMessage(m_browserWindow, WM_COMMAND, WM_USER + 1, id);
-            SendMessage(m_mainWindow, WM_COMMAND, WM_SHADER(id), 0);
-        }
-        catch(file_error& ex)
-        {
-            errorMsg = std::string(ex.what()) + "\r\n\r\nIf this is a RetroArch preset pack, install it in RetroArch's directory first\r\nand import into ShaderGlass from there.";
-        }
-        catch(std::exception& ex)
-        {
-            errorMsg = std::string(ex.what());
-        }
-        EnableWindow(m_mainWindow, true);
-        ShowWindow(m_compileWindow, SW_HIDE);
-        m_importPath = std::filesystem::path();
+    ResetParams();
+}
 
-        if(errorMsg.size())
-        {
-            MessageBox(m_mainWindow, convertCharArrayToLPCWSTR(errorMsg.c_str()), L"ShaderGlass", MB_OK);
-        }
+void ShaderGlass::SetInputScale(float w, float h)
+{
+    m_inputScaleW   = w;
+    m_inputScaleH   = h;
+    m_inputRescaled = true;
+}
 
-        if(m_forceStart)
-        {
-            m_forceStart = false;
-            PostMessage(m_mainWindow, WM_COMMAND, IDM_START, 0);
-        }
+void ShaderGlass::SetOutputScale(float w, float h)
+{
+    m_outputScaleW   = w;
+    m_outputScaleH   = h;
+    m_outputRescaled = true;
+}
+
+void ShaderGlass::SetOutputFlip(bool h, bool v)
+{
+    m_flipHorizontal = h;
+    m_flipVertical   = v;
+    m_outputRescaled = true;
+}
+
+void ShaderGlass::SetShaderPreset(PresetDef* p, const std::vector<std::tuple<int, std::string, double>>& params)
+{
+    m_newShaderPreset = std::make_unique<Preset>(*p);
+    m_newParams       = params;
+}
+
+void ShaderGlass::SetFrameSkip(int s)
+{
+    m_frameSkip = s;
+}
+
+void ShaderGlass::SetLockedArea(RECT lockedArea)
+{
+    m_lockedArea.top    = lockedArea.top;
+    m_lockedArea.bottom = lockedArea.bottom;
+    m_lockedArea.left   = lockedArea.left;
+    m_lockedArea.right  = lockedArea.right;
+    m_lockedAreaUpdated = true;
+}
+
+void ShaderGlass::SetCroppedArea(RECT croppedArea)
+{
+    if(m_croppedArea.top != croppedArea.top || m_croppedArea.bottom != croppedArea.bottom || m_croppedArea.left != croppedArea.left || m_croppedArea.right != croppedArea.right)
+    {
+        m_croppedArea.top    = croppedArea.top;
+        m_croppedArea.bottom = croppedArea.bottom;
+        m_croppedArea.left   = croppedArea.left;
+        m_croppedArea.right  = croppedArea.right;
+        m_croppedAreaUpdated = true;
     }
 }
 
-bool ShaderWindow::ImportShader(const std::wstring& fileName, bool forceStart)
+void ShaderGlass::SetFreeScale(bool freeScale)
 {
-    try
+    m_freeScale      = freeScale;
+    m_outputRescaled = true;
+}
+
+void ShaderGlass::SetVertical(bool vertical)
+{
+    if(m_vertical != vertical)
     {
-        m_importPath = fileName;
+        m_vertical        = vertical;
+        m_verticalUpdated = true;
+    }
+}
 
-        if(m_importPath.empty())
-            return false;
+void ShaderGlass::DestroyTargets()
+{
+    if(m_preprocessedRenderTarget != nullptr)
+    {
+        m_preprocessedRenderTarget = nullptr;
+        m_originalView             = nullptr;
+        m_preprocessedTexture      = nullptr;
+    }
+}
 
-        AddRecentImport(m_importPath);
-
-        RECT rc, rcDlg, rcOwner;
-        GetWindowRect(m_mainWindow, &rcOwner);
-        GetWindowRect(m_compileWindow, &rcDlg);
-        CopyRect(&rc, &rcOwner);
-        OffsetRect(&rcDlg, -rcDlg.left, -rcDlg.top);
-        OffsetRect(&rc, -rc.left, -rc.top);
-        OffsetRect(&rc, -rcDlg.right, -rcDlg.bottom);
-        SetWindowPos(m_compileWindow,
-                     HWND_TOP,
-                     rcOwner.left + (rc.right / 2),
-                     rcOwner.top + max(0, (rc.bottom / 2)),
-                     0,
-                     0, // Ignores size arguments.
-                     SWP_NOSIZE);
-
-        ShowWindow(m_compileWindow, SW_SHOW);
-        EnableWindow(m_mainWindow, false);
-        if(!m_compileEvent)
+void ShaderGlass::UpdateParams()
+{
+    for(auto& s : m_shaderPreset->m_shaders)
+        for(auto& p : s.Params())
         {
-            m_compileEvent = CreateEvent(NULL, TRUE, FALSE, TEXT("CompileEvent"));
+            if(p->size == 4 && p->name != "FrameCount")
+                s.SetParam(p, &p->currentValue);
         }
-        if(!m_compileThread)
+}
+
+float ShaderGlass::GetDefaultValue(ShaderParam* p)
+{
+    for(auto& o : m_shaderPreset->m_presetDef.Overrides)
+    {
+        if(o.name == p->name)
         {
-            m_compileThread = CreateThread(NULL, 0, CompileThreadFuncProxy, this, 0, NULL);
+            return o.value;
         }
-        if(m_compileEvent)
+    }
+    return p->defaultValue;
+}
+
+void ShaderGlass::ResetParams()
+{
+    for(auto& s : m_shaderPreset->m_shaders)
+        for(auto& p : s.Params())
         {
-            m_forceStart = forceStart;
-            SetEvent(m_compileEvent);
+            if(p->size == 4 && p->name != "FrameCount")
+            {
+                // check for preset override
+                auto hasOverride = false;
+                for(auto& o : m_shaderPreset->m_presetDef.Overrides)
+                {
+                    if(o.name == p->name)
+                    {
+                        s.SetParam(p, &o.value);
+                        hasOverride = true;
+                        break;
+                    }
+                }
+                if(!hasOverride)
+                {
+                    s.SetParam(p, &p->defaultValue);
+                }
+            }
+        }
+}
+
+std::vector<std::tuple<int, ShaderParam*>> ShaderGlass::Params()
+{
+    std::vector<std::tuple<int, ShaderParam*>> params;
+    int                                        i = 0;
+    for(auto& s : m_shaderPreset->m_shaders)
+    {
+        for(auto& p : s.Params())
+            if(p->size == 4 && p->name != "FrameCount")
+                params.push_back(std::make_tuple(i, p));
+
+        i++;
+    }
+    return params;
+}
+
+void ShaderGlass::SetSwapchainColorSpace()
+{
+    assert(m_swapChain3.get());
+
+    if(m_swapChain3.get())
+    {
+        hr = m_swapChain3->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709);
+        assert(SUCCEEDED(hr));
+    }
+}
+
+bool ShaderGlass::TryResizeSwapChain(const RECT& clientRect, bool force)
+{
+    if(force || (clientRect.right != m_lastSize.x) || (clientRect.bottom != m_lastSize.y))
+    {
+        // force recreate
+        DestroyTargets();
+
+        m_lastSize.x = clientRect.right;
+        m_lastSize.y = clientRect.bottom;
+
+        m_displayTexture      = nullptr;
+        m_displayRenderTarget = nullptr;
+
+        if(clientRect.right > 0 && clientRect.bottom > 0)
+        {
+            UINT flags = 0;
+            if(m_flipMode && m_allowTearing)
+                flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+            hr = m_swapChain->ResizeBuffers(0, static_cast<UINT>(clientRect.right), static_cast<UINT>(clientRect.bottom), DXGI_FORMAT_UNKNOWN, flags);
+            assert(SUCCEEDED(hr));
+
+            hr = m_swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)m_displayTexture.put());
+            assert(SUCCEEDED(hr));
+
+            hr = m_device->CreateRenderTargetView(m_displayTexture.get(), NULL, m_displayRenderTarget.put());
+            assert(SUCCEEDED(hr));
+
+            if(m_useHDR)
+            {
+                SetSwapchainColorSpace();
+            }
         }
         return true;
     }
-    catch(std::exception& ex)
-    {
-        MessageBox(m_mainWindow, convertCharArrayToLPCWSTR(ex.what()), L"ShaderGlass", MB_OK);
-        return false;
-    }
-}
-
-BOOL CALLBACK ShaderWindow::EnumDisplayMonitorsProc(_In_ HMONITOR hMonitor, _In_ HDC hDC, _In_ LPRECT lpRect, _In_ LPARAM lParam)
-{
-    if(m_captureDisplays.size() >= MAX_CAPTURE_DISPLAYS)
-        return false;
-
-    MONITORINFOEX info;
-    info.cbSize = sizeof(info);
-    GetMonitorInfo(hMonitor, &info);
-
-    char utfName[MAX_WINDOW_TITLE];
-    WideCharToMultiByte(CP_UTF8, 0, info.szDevice, -1, utfName, MAX_WINDOW_TITLE, NULL, NULL);
-    CaptureDisplay cd(hMonitor, std::string(utfName));
-    if(cd.name.size())
-        m_captureDisplays.emplace_back(cd);
-
-    return true;
-}
-
-BOOL CALLBACK ShaderWindow::EnumWindowsProc(_In_ HWND hwnd, _In_ LPARAM lParam)
-{
-    if(m_captureWindows.size() >= MAX_CAPTURE_WINDOWS)
-        return false;
-
-    if(hwnd != m_mainWindow && IsWindowVisible(hwnd) && IsAltTabWindow(hwnd))
-    {
-        DWORD isCloaked;
-        DWORD size = sizeof(isCloaked);
-        DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &isCloaked, size);
-
-        if(!isCloaked)
-        {
-            TITLEBARINFO ti;
-            ti.cbSize = sizeof(ti);
-            GetTitleBarInfo(hwnd, &ti);
-
-            // commented out to find Kodi window
-            /*if(ti.rgstate[0] & STATE_SYSTEM_INVISIBLE)
-                return true;*/
-
-            if(GetWindowLong(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW)
-                return true;
-
-            CaptureWindow cw(hwnd, GetWindowStringText(hwnd));
-            if(cw.name.size())
-                m_captureWindows.emplace_back(cw);
-        }
-    }
-    return true;
-}
-
-void ShaderWindow::ScanWindows()
-{
-    m_captureWindows.clear();
-    for(UINT i = 0; i < MAX_CAPTURE_WINDOWS; i++)
-    {
-        RemoveMenu(m_windowMenu, WM_CAPTURE_WINDOW(i), MF_BYCOMMAND);
-    }
-
-    if(HasCaptureAPI())
-    {
-        EnumWindows(&ShaderWindow::EnumWindowsProcProxy, (LPARAM)this);
-    }
-    else if(HasCaptureLib())
-    {
-        m_captureWindows.emplace_back(HWND_BROADCAST, L"Choose...");
-    }
-
-    UINT i = 0;
-    for(const auto& w : m_captureWindows)
-    {
-        AppendMenu(m_windowMenu, MF_STRING, WM_CAPTURE_WINDOW(i++), w.name.c_str());
-        if(m_captureOptions.captureWindow == w.hwnd)
-            CheckMenuItem(m_windowMenu, WM_CAPTURE_WINDOW(i - 1), MF_CHECKED | MF_BYCOMMAND);
-    }
-}
-
-void ShaderWindow::ScanDevices()
-{
-    RemoveMenu(m_deviceMenu, ID_DEVICE_NODEVICESFOUND, MF_BYCOMMAND);
-
-    auto numDevices = GetMenuItemCount(m_deviceMenu);
-    for(int i = numDevices - 1; i >= 0; i--)
-    {
-        auto deviceMenu = GetSubMenu(m_deviceMenu, i);
-        auto numFormats = GetMenuItemCount(deviceMenu);
-        for(int j = numFormats - 1; j >= 0; j--)
-            RemoveMenu(deviceMenu, j, MF_BYPOSITION);
-        RemoveMenu(m_deviceMenu, i, MF_BYPOSITION);
-    }
-
-    const auto& captureDevices = m_captureManager.CaptureDevices();
-
-    if(!captureDevices.size())
-    {
-        InsertMenu(m_deviceMenu, 1, MF_STRING | MF_DISABLED | MF_GRAYED, ID_DEVICE_NODEVICESFOUND, TEXT("No capture devices"));
-        return;
-    }
-
-    for(auto& w : captureDevices)
-    {
-        auto deviceMenu = CreatePopupMenu();
-        for(auto& f : w.formats)
-        {
-            if(f.deviceFormatNo)
-            {
-                auto id = WM_CAPTURE_DEVICE_FORMAT(f.deviceFormatNo);
-                InsertMenu(deviceMenu, 1, MF_STRING, id, f.name.c_str());
-
-                if(m_captureOptions.deviceFormatNo == f.deviceFormatNo)
-                    CheckMenuItem(deviceMenu, id, MF_CHECKED | MF_BYCOMMAND);
-            }
-        }
-
-        InsertMenu(m_deviceMenu, 1, MF_BYPOSITION | MF_STRING | MF_POPUP, (UINT_PTR)deviceMenu, w.name.c_str());
-    }
-}
-
-void ShaderWindow::ScanDisplays()
-{
-    m_captureDisplays.clear();
-    for(UINT i = 0; i < MAX_CAPTURE_DISPLAYS; i++)
-    {
-        RemoveMenu(m_displayMenu, WM_CAPTURE_DISPLAY(i), MF_BYCOMMAND);
-    }
-
-    if(HasCaptureAPI())
-    {
-        if(!Is1903())
-        {
-            CaptureDisplay cd(NULL, "All Displays");
-            m_captureDisplays.emplace_back(cd);
-        }
-        else
-        {
-            CaptureDisplay cd(MonitorFromWindow(m_mainWindow, MONITOR_DEFAULTTOPRIMARY), "Current Display");
-            m_captureDisplays.emplace_back(cd);
-        }
-
-        EnumDisplayMonitors(NULL, NULL, &ShaderWindow::EnumDisplayMonitorsProcProxy, (LPARAM)this);
-    }
-    else if(HasCaptureLib())
-    {
-        CaptureDisplay cd(NULL, "Choose...");
-        m_captureDisplays.emplace_back(cd);
-    }
-    else
-    {
-        return;
-    }
-
-    UINT i = 0;
-    for(const auto& w : m_captureDisplays)
-    {
-        InsertMenu(m_displayMenu, 2, MF_STRING, WM_CAPTURE_DISPLAY(i++), convertCharArrayToLPCWSTR(w.name.c_str()));
-        if(m_captureOptions.monitor == w.monitor)
-            CheckMenuItem(m_displayMenu, WM_CAPTURE_DISPLAY(i - 1), MF_CHECKED | MF_BYCOMMAND);
-    }
-}
-
-void ShaderWindow::CropWindow()
-{
-    StartDialog();
-    m_cropDialog->Show(m_captureOptions.croppedArea);
-    EndDialog();
-}
-
-void ShaderWindow::BuildProgramMenu()
-{
-    m_frameSkipMenu = GetSubMenu(m_programMenu, 9);
-    for(const auto& fs : frameSkips)
-    {
-        AppendMenu(m_frameSkipMenu, MF_STRING, fs.first, fs.second.text);
-    }
-
-    m_recentMenu = CreatePopupMenu();
-    InsertMenu(m_programMenu, 14, MF_BYPOSITION | MF_STRING | MF_POPUP, (UINT_PTR)m_recentMenu, L"Recent profiles");
-    LoadRecentProfiles();
-
-    m_hotkeysMenu  = GetSubMenu(m_programMenu, 3);
-    m_gpuMenu      = GetSubMenu(m_programMenu, 7);
-    m_advancedMenu = GetSubMenu(m_programMenu, 10);
-    if(!HasCaptureAPI())
-    {
-        EnableMenuItem(m_programMenu, 10, MF_BYPOSITION | MF_DISABLED | MF_GRAYED);
-    }
-}
-
-void ShaderWindow::BuildInputMenu()
-{
-    m_inputMenu = GetSubMenu(m_mainMenu, 1);
-
-    RemoveMenu(GetSubMenu(m_inputMenu, 0), ID_DESKTOP_DUMMY, MF_BYCOMMAND);
-
-    m_pixelSizeMenu = CreatePopupMenu();
-    AppendMenu(m_pixelSizeMenu, MF_STRING, IDM_PIXELSIZE_NEXT, L"Next\tp");
-    AppendMenu(m_pixelSizeMenu, MF_STRING, IDM_PIXELSIZE_PREV, L"Previous\to");
-
-    auto systemDpi = GetDpiForSystem();
-    char dpiMenu[100];
-    m_dpiScale = GetDpiForSystem() / (float)USER_DEFAULT_SCREEN_DPI;
-    snprintf(dpiMenu, 100, "Adjust for DPI Scale (%d%%)", static_cast<int>(100.0f * m_dpiScale));
-    AppendMenu(m_pixelSizeMenu, MF_STRING, IDM_PIXELSIZE_DPI, convertCharArrayToLPCWSTR(dpiMenu));
-    if(systemDpi == USER_DEFAULT_SCREEN_DPI)
-    {
-        // no scaling can be applied
-        m_dpiScale = 1.0f;
-        EnableMenuItem(m_pixelSizeMenu, IDM_PIXELSIZE_DPI, MF_BYCOMMAND | MF_DISABLED | MF_GRAYED);
-    }
-    for(const auto& px : pixelSizes)
-    {
-        AppendMenu(m_pixelSizeMenu, MF_STRING, px.first, px.second.text);
-    }
-    InsertMenu(m_inputMenu, 5, MF_BYPOSITION | MF_STRING | MF_POPUP, (UINT_PTR)m_pixelSizeMenu, L"Pixel Size");
-
-    m_displayMenu = GetSubMenu(m_inputMenu, 0);
-    m_windowMenu  = GetSubMenu(m_inputMenu, 1);
-    RemoveMenu(m_windowMenu, 0, MF_BYPOSITION);
-    m_deviceMenu = GetSubMenu(m_inputMenu, 2);
-}
-
-void ShaderWindow::BuildOutputMenu()
-{
-    m_outputMenu = GetSubMenu(m_mainMenu, 2);
-    DeleteMenu(m_outputMenu, 0, MF_BYPOSITION);
-
-    m_modeMenu         = GetSubMenu(m_outputMenu, 0);
-    m_outputWindowMenu = GetSubMenu(m_outputMenu, 1);
-    m_flipMenu         = GetSubMenu(m_outputMenu, 2);
-
-    m_outputScaleMenu = CreatePopupMenu();
-    AppendMenu(m_outputScaleMenu, MF_STRING, IDM_OUTPUT_FREESCALE, L"Free");
-    for(const auto& os : outputScales)
-    {
-        AppendMenu(m_outputScaleMenu, MF_STRING, os.first, os.second.text);
-    }
-    AppendMenu(m_outputScaleMenu, MF_STRING, IDM_OUTPUT_LOCKSCALE, L"Retain");
-    InsertMenu(m_outputMenu, 3, MF_BYPOSITION | MF_STRING | MF_POPUP, (UINT_PTR)m_outputScaleMenu, L"Scale");
-
-    m_aspectRatioMenu = CreatePopupMenu();
-    for(const auto& ar : aspectRatios)
-    {
-        AppendMenu(m_aspectRatioMenu, MF_STRING, ar.first, ar.second.text);
-    }
-    InsertMenu(m_outputMenu, 4, MF_BYPOSITION | MF_STRING | MF_POPUP, (UINT_PTR)m_aspectRatioMenu, L"Aspect Ratio Correction");
-
-    m_orientationMenu = GetSubMenu(m_outputMenu, 5);
-
-    InsertMenu(m_outputMenu, 6, MF_BYPOSITION | MF_STRING, ID_PROCESSING_FULLSCREEN, L"Fullscreen\tCtrl+Shift+G");
-}
-
-void ShaderWindow::BuildShaderMenu()
-{
-    // now deferred to BrowserWindow
-    m_numPresets = (unsigned int)m_captureManager.Presets().size();
-    if(m_numPresets >= MAX_SHADERS)
-        throw std::runtime_error("Too many shaders!");
-
-    m_importsMenu = CreatePopupMenu();
-    InsertMenu(m_shaderMenu, 7, MF_BYPOSITION | MF_STRING | MF_POPUP, (UINT_PTR)m_importsMenu, L"Recent imports");
-    LoadRecentImports();
-}
-
-LRESULT CALLBACK ShaderWindow::WndProcProxy(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
-{
-    ShaderWindow* app;
-    if(msg == WM_CREATE)
-    {
-        app = (ShaderWindow*)(((LPCREATESTRUCT)lParam)->lpCreateParams);
-        SetWindowLongPtr(hWnd, GWLP_USERDATA, (LONG_PTR)app);
-    }
-    else
-    {
-        app = (ShaderWindow*)GetWindowLongPtr(hWnd, GWLP_USERDATA);
-    }
-    return app->WndProc(hWnd, msg, wParam, lParam);
-}
-
-BOOL CALLBACK ShaderWindow::EnumWindowsProcProxy(_In_ HWND hwnd, _In_ LPARAM lParam)
-{
-    return ((ShaderWindow*)lParam)->EnumWindowsProc(hwnd, 0);
-}
-
-BOOL CALLBACK ShaderWindow::EnumDisplayMonitorsProcProxy(_In_ HMONITOR hMonitor, _In_ HDC hDC, _In_ LPRECT lpRect, _In_ LPARAM lParam)
-{
-    return ((ShaderWindow*)lParam)->EnumDisplayMonitorsProc(hMonitor, hDC, lpRect, lParam);
-}
-
-ATOM ShaderWindow::MyRegisterClass(HINSTANCE hInstance)
-{
-    WNDCLASSEXW wcex;
-
-    wcex.cbSize = sizeof(WNDCLASSEX);
-
-    wcex.style         = CS_HREDRAW | CS_VREDRAW;
-    wcex.lpfnWndProc   = ShaderWindow::WndProcProxy;
-    wcex.cbClsExtra    = 0;
-    wcex.cbWndExtra    = 0;
-    wcex.hInstance     = hInstance;
-    wcex.hIcon         = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_SHADERGLASS));
-    wcex.hCursor       = LoadCursor(nullptr, IDC_ARROW);
-    wcex.hbrBackground = CreateSolidBrush(0x00000000);
-    wcex.lpszMenuName  = MAKEINTRESOURCEW(IDC_SHADERGLASS);
-    wcex.lpszClassName = m_windowClass;
-    wcex.hIconSm       = LoadIcon(wcex.hInstance, MAKEINTRESOURCE(IDI_SMALL));
-    //wcex.hCursor = NULL;
-
-    return RegisterClassExW(&wcex);
-}
-
-bool ShaderWindow::GetStartingPositionState()
-{
-    return GetRegistryOption(L"Remember Position", false);
-}
-
-void ShaderWindow::SaveStartingPositionState(bool state)
-{
-    SaveRegistryOption(L"Remember Position", state);
-    if(!state)
-        ForgetStartingPosition();
-}
-
-void ShaderWindow::GetStartingPosition(int& x, int& y, int& w, int& h)
-{
-    if(GetStartingPositionState())
-    {
-        x = GetRegistryInt(L"X", 0);
-        y = GetRegistryInt(L"Y", 0);
-        w = GetRegistryInt(L"W", 0);
-        h = GetRegistryInt(L"H", 0);
-
-        POINT tl;
-        tl.x = x + 8;
-        tl.y = y + 8;
-        POINT br;
-        br.x = x + w - 8;
-        br.y = y + h - 8;
-        if(MonitorFromPoint(tl, MONITOR_DEFAULTTONULL) == NULL && MonitorFromPoint(br, MONITOR_DEFAULTTONULL) == NULL)
-        {
-            // off-screen start?
-            w = 0;
-            h = 0;
-        }
-    }
-    if(w <= 0 || h <= 0)
-    {
-        // defaults
-        x = CW_USEDEFAULT;
-        y = CW_USEDEFAULT;
-        w = 960;
-        h = 600;
-
-        RECT rect;
-        rect.left   = 0;
-        rect.top    = 0;
-        rect.right  = w;
-        rect.bottom = h;
-        AdjustWindowRectEx(&rect, WS_OVERLAPPEDWINDOW, true, WS_EX_WINDOWEDGE);
-        w = rect.right - rect.left;
-        h = rect.bottom - rect.top;
-    }
-}
-
-void ShaderWindow::SaveStartingPosition()
-{
-    if(GetStartingPositionState())
-    {
-        RECT rc;
-        GetWindowRect(m_mainWindow, &rc);
-        SaveRegistryInt(L"X", rc.left);
-        SaveRegistryInt(L"Y", rc.top);
-        SaveRegistryInt(L"W", rc.right - rc.left);
-        SaveRegistryInt(L"H", rc.bottom - rc.top);
-    }
-}
-
-void ShaderWindow::ForgetStartingPosition()
-{
-    SaveRegistryInt(L"X", 0);
-    SaveRegistryInt(L"Y", 0);
-    SaveRegistryInt(L"W", 0);
-    SaveRegistryInt(L"H", 0);
-}
-
-BOOL ShaderWindow::InitInstance(HINSTANCE hInstance, int nCmdShow)
-{
-    m_instance = hInstance;
-
-    int x = 0, y = 0, w = 0, h = 0;
-    GetStartingPosition(x, y, w, h);
-
-    HWND hWnd = CreateWindowW(m_windowClass, m_title, WS_OVERLAPPEDWINDOW | WS_EX_WINDOWEDGE, x, y, w, h, nullptr, nullptr, hInstance, this);
-
-    if(!hWnd)
-    {
-        return FALSE;
-    }
-
-    m_mainWindow = hWnd;
-    m_dpi        = GetDpiForWindow(hWnd);
-    ShowWindow(hWnd, nCmdShow);
-    UpdateWindow(hWnd);
-
-    return TRUE;
-}
-
-void ShaderWindow::SetTransparent(bool transparent)
-{
-    if(transparent != m_isTransparent)
-    {
-        LONG cur_style = GetWindowLong(m_mainWindow, GWL_EXSTYLE);
-        if(transparent)
-            SetWindowLong(m_mainWindow, GWL_EXSTYLE, cur_style | WS_EX_TRANSPARENT);
-        else
-            SetWindowLong(m_mainWindow, GWL_EXSTYLE, cur_style & ~WS_EX_TRANSPARENT);
-        m_isTransparent = transparent;
-    }
-}
-
-void ShaderWindow::AdjustWindowSize(HWND hWnd)
-{
-    if(m_isBorderless)
-        return;
-
-    // resize client area to captured window/file x scale
-    if(m_captureManager.IsActive() && !m_captureOptions.freeScale &&
-       ((m_captureOptions.captureWindow && m_captureOptions.clone) || !m_captureOptions.imageFile.empty() || m_captureOptions.deviceFormatNo))
-    {
-        LONG inputWidth = 0, inputHeight = 0;
-
-        if(m_captureOptions.captureWindow != 0)
-        {
-            if(m_captureOptions.captureWindow == HWND_BROADCAST)
-            {
-                m_captureManager.GetCaptureSize(inputWidth, inputHeight);
-                if(inputWidth == 0 || inputHeight == 0)
-                    return;
-            }
-            else
-            {
-                RECT captureRect;
-                GetClientRect(m_captureOptions.captureWindow, &captureRect);
-                inputWidth  = captureRect.right;
-                inputHeight = captureRect.bottom;
-            }
-        }
-        else
-        {
-            inputWidth  = m_captureOptions.imageWidth;
-            inputHeight = m_captureOptions.imageHeight;
-        }
-        inputWidth -= (m_captureOptions.croppedArea.left + m_captureOptions.croppedArea.right);
-        inputHeight -= (m_captureOptions.croppedArea.top + m_captureOptions.croppedArea.bottom);
-
-        RECT r;
-        GetClientRect(hWnd, &r);
-        LONG requiredW, requiredH;
-        if(m_captureOptions.vertical)
-        {
-            requiredW = static_cast<LONG>(roundf(inputWidth * m_captureOptions.outputScale));
-            requiredH = static_cast<LONG>(roundf(inputHeight * m_captureOptions.outputScale * m_captureOptions.aspectRatio));
-        }
-        else
-        {
-            requiredW = static_cast<LONG>(roundf(inputWidth * m_captureOptions.outputScale / m_captureOptions.aspectRatio));
-            requiredH = static_cast<LONG>(roundf(inputHeight * m_captureOptions.outputScale));
-        }
-        if(requiredW == 0)
-            requiredW = 1;
-        if(requiredH == 0)
-            requiredH = 1;
-
-        if(r.right != requiredW || r.bottom != requiredH)
-        {
-            r.right  = requiredW;
-            r.bottom = requiredH;
-
-            auto dpi = GetDpiForWindow(hWnd);
-            if(dpi != m_dpi)
-            {
-                m_dpi = dpi;
-                return; // avoid infinite loop of resize/reposition during DPI change
-            }
-            LONG extStyle = GetWindowLong(m_mainWindow, GWL_EXSTYLE);
-            AdjustWindowRectExForDpi(&r, GetWindowLong(hWnd, GWL_STYLE), GetMenu(hWnd) != 0, extStyle, dpi);
-            SetWindowPos(hWnd, HWND_TOPMOST, 0, 0, r.right - r.left, r.bottom - r.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE);
-        }
-    }
-    else if(!m_isBorderless)
-    {
-        float xAlign = m_captureOptions.pixelWidth * m_captureOptions.outputScale;
-        float yAlign = m_captureOptions.pixelHeight * m_captureOptions.outputScale;
-        if(xAlign != 1 || yAlign != 1)
-        {
-            RECT clientRect;
-            GetClientRect(hWnd, &clientRect);
-
-            int requiredW = static_cast<LONG>(static_cast<int>(roundf(clientRect.right / xAlign)) * xAlign);
-            int requiredH = static_cast<LONG>(static_cast<int>(roundf(clientRect.bottom / yAlign)) * yAlign);
-            if(requiredW == 0)
-                requiredW = 1;
-            if(requiredH == 0)
-                requiredH = 1;
-
-            if(requiredW != clientRect.right || requiredH != clientRect.bottom)
-            {
-                clientRect.right  = requiredW;
-                clientRect.bottom = requiredH;
-                auto dpi          = GetDpiForWindow(hWnd);
-                if(dpi != m_dpi)
-                {
-                    m_dpi = dpi;
-                    return; // avoid infinite loop of resize/reposition during DPI change
-                }
-                LONG extStyle = GetWindowLong(m_mainWindow, GWL_EXSTYLE);
-                AdjustWindowRectExForDpi(&clientRect, GetWindowLong(hWnd, GWL_STYLE), GetMenu(hWnd) != 0, extStyle, dpi);
-
-                RECT windowRect;
-                GetWindowRect(hWnd, &windowRect);
-                SetWindowPos(hWnd,
-                             HWND_TOPMOST,
-                             0,
-                             0,
-                             clientRect.right - clientRect.left,
-                             clientRect.bottom - clientRect.top,
-                             SWP_NOMOVE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE);
-            }
-        }
-    }
-}
-
-void ShaderWindow::UpdateWindowState()
-{
-    // always topmost when processing
-    if(m_captureManager.IsActive() && !m_inDialog && !m_captureManager.WaitingOnFirstFrame())
-        SetWindowPos(m_mainWindow, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-    else
-        SetWindowPos(m_mainWindow, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-
-    LONG cur_style = GetWindowLong(m_mainWindow, GWL_EXSTYLE);
-    if(m_captureManager.IsActive() && m_captureOptions.transparent)
-        // active desktop glass mode - layered/transparent window
-        SetWindowLong(m_mainWindow, GWL_EXSTYLE, cur_style | WS_EX_LAYERED);
-    else
-        // clone or normal window
-        SetWindowLong(m_mainWindow, GWL_EXSTYLE, cur_style & ~WS_EX_LAYERED);
-
-    if(HasCaptureAPI())
-    {
-        if(m_captureManager.IsActive() && !m_captureOptions.clone && !m_captureOptions.captureWindow)
-        // desktop glass - exclude from capture
-        {
-            SetWindowDisplayAffinity(m_mainWindow, WDA_EXCLUDEFROMCAPTURE);
-            //SetWindowDisplayAffinity(m_paramsWindow, WDA_EXCLUDEFROMCAPTURE);
-        }
-        else
-        {
-            SetWindowDisplayAffinity(m_mainWindow, WDA_NONE);
-            //SetWindowDisplayAffinity(m_paramsWindow, WDA_NONE);
-        }
-    }
-
-    UpdateTitle();
-
-    AdjustWindowSize(m_mainWindow);
-}
-
-void ShaderWindow::UpdateTitle()
-{
-    // update title
-    if(m_captureManager.IsActive())
-    {
-        const auto& pixelSize   = pixelSizes.at(WM_PIXEL_SIZE(m_selectedPixelSize));
-        const auto& outputScale = outputScales.at(WM_OUTPUT_SCALE(m_selectedOutputScale));
-        const auto& aspectRatio = aspectRatios.at(WM_ASPECT_RATIO(m_selectedAspectRatio));
-        const auto& shader      = m_captureManager.Presets().at(m_captureOptions.presetNo);
-
-        wchar_t windowName[26];
-        windowName[0] = 0;
-        if(m_captureOptions.captureWindow)
-        {
-            auto captureTitle = GetWindowStringText(m_captureOptions.captureWindow);
-            if(captureTitle.size())
-            {
-                if(captureTitle.find(',') > 0)
-                {
-                    captureTitle = captureTitle.substr(0, captureTitle.find(','));
-                }
-                if(captureTitle.size() > 20)
-                {
-                    captureTitle = captureTitle.substr(0, 20) + _T("...");
-                }
-                captureTitle += _T(", ");
-                wcsncpy_s(windowName, captureTitle.c_str(), 26);
-            }
-        }
-
-        wchar_t     title[200];
-        const char* scaleString = m_captureOptions.freeScale ? "free" : outputScale.mnemonic;
-        const auto  inFPS       = (int)roundf(m_captureManager.InFPS());
-        const auto  outFPS      = (int)roundf(m_captureManager.OutFPS());
-        char        advancedFlags[10];
-        advancedFlags[0] = ' ';
-        int a            = 1;
-        if(m_captureOptions.flipMode)
-        {
-            advancedFlags[a++] = 'F';
-            if(m_captureOptions.allowTearing)
-                advancedFlags[a++] = 'T';
-        }
-        if(m_captureOptions.maxCaptureRate)
-            advancedFlags[a++] = 'M';
-        advancedFlags[a] = 0;
-        if(a == 1)
-            advancedFlags[0] = 0;
-        char inFPSdisplay[20] = "";
-        if(m_captureOptions.flipMode || m_captureOptions.maxCaptureRate)
-            snprintf(inFPSdisplay, 20, "%d->", inFPS);
-        _snwprintf_s(title,
-                     200,
-                     _T("ShaderGlass (%s%S, %Spx, %S%%, ~%S, %S%dfps%S)"),
-                     windowName,
-                     shader->Name.c_str(),
-                     pixelSize.mnemonic,
-                     scaleString,
-                     aspectRatio.mnemonic,
-                     inFPSdisplay,
-                     outFPS,
-                     advancedFlags);
-        SetWindowTextW(m_mainWindow, title);
-    }
-    else if(m_firstStart)
-    {
-        SetWindowTextW(m_mainWindow, _T("ShaderGlass (no input selected)"));
-    }
-    else
-    {
-        SetWindowTextW(m_mainWindow, _T("ShaderGlass (stopped)"));
-    }
-}
-
-LRESULT CALLBACK ShaderWindow::WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
-{
-    switch(message)
-    {
-    case WM_COMMAND: {
-        UINT wmId = LOWORD(wParam);
-        switch(wmId)
-        {
-        case IDM_START:
-            if(!Start())
-                return 0;
-            break;
-        case ID_PROCESSING_FULLSCREEN:
-            ToggleBorderless(hWnd);
-            break;
-        case ID_PROCESSING_PAUSE:
-            if(m_captureManager.IsActive())
-                Stop();
-            else
-                Start();
-            break;
-        case ID_PROCESSING_SCREENSHOT:
-            SetTimer(m_mainWindow, ID_PROCESSING_SCREENSHOT, MENU_FADE_DELAY, NULL);
-            break;
-        case IDM_UPDATE_PARAMS:
-            PostMessage(m_paramsWindow, WM_COMMAND, IDM_UPDATE_PARAMS, 0);
-            break;
-        case ID_SHADER_BROWSE: {
-            if(!m_browserPositioned)
-            {
-                RECT rc, rcDlg, rcOwner;
-                GetWindowRect(m_mainWindow, &rcOwner);
-                GetWindowRect(m_browserWindow, &rcDlg);
-                CopyRect(&rc, &rcOwner);
-                OffsetRect(&rcDlg, -rcDlg.left, -rcDlg.top);
-                OffsetRect(&rc, -rc.left, -rc.top);
-                OffsetRect(&rc, -rcDlg.right, -rcDlg.bottom);
-
-                if(!SetWindowPos(m_browserWindow,
-                                 HWND_TOP,
-                                 rcOwner.right - (rcDlg.right - rcDlg.left),
-                                 rcOwner.top + max(0, (rc.bottom / 2)),
-                                 0,
-                                 0, // Ignores size arguments.
-                                 SWP_NOSIZE))
-                {
-                    int x = 4;
-                    x++;
-                }
-                m_browserPositioned = true;
-            }
-            ShowWindow(m_browserWindow, SW_SHOW);
-        }
-            return 0;
-        case IDM_SHADER_PARAMETERS: {
-            if(!m_paramsPositioned)
-            {
-                RECT rc, rcDlg, rcOwner;
-                GetWindowRect(m_mainWindow, &rcOwner);
-                GetWindowRect(m_paramsWindow, &rcDlg);
-                CopyRect(&rc, &rcOwner);
-                OffsetRect(&rcDlg, -rcDlg.left, -rcDlg.top);
-                OffsetRect(&rc, -rc.left, -rc.top);
-                OffsetRect(&rc, -rcDlg.right, -rcDlg.bottom);
-
-                SetWindowPos(m_paramsWindow,
-                             HWND_TOP,
-                             rcOwner.left + (rc.right / 2),
-                             rcOwner.top + max(0, (rc.bottom / 2)),
-                             0,
-                             0, // Ignores size arguments.
-                             SWP_NOSIZE);
-                m_paramsPositioned = true;
-            }
-            ShowWindow(m_paramsWindow, SW_SHOW);
-        }
-            return 0;
-        case IDM_TOGGLEMENU:
-            if(GetMenu(hWnd))
-                SetMenu(hWnd, NULL);
-            else
-                SetMenu(hWnd, m_mainMenu);
-            break;
-        case ID_INPUT_FILE:
-            LoadInputImage();
-            break;
-        case ID_PROCESSING_SETASDEFAULT:
-            SaveDefault();
-            break;
-        case ID_PROCESSING_REMOVEDEFAULT:
-            RemoveDefault();
-            break;
-        case ID_GLOBALHOTKEYS_ENABLE:
-            if(GetMenuState(m_hotkeysMenu, ID_GLOBALHOTKEYS_ENABLE, MF_BYCOMMAND) & MF_CHECKED)
-            {
-                UnregisterHotkeys();
-                CheckMenuItem(m_hotkeysMenu, ID_GLOBALHOTKEYS_ENABLE, MF_UNCHECKED);
-                SaveHotkeyState(false);
-            }
-            else
-            {
-                RegisterHotkeys();
-                CheckMenuItem(m_hotkeysMenu, ID_GLOBALHOTKEYS_ENABLE, MF_CHECKED);
-                SaveHotkeyState(true);
-            }
-            break;
-        case ID_PROCESSING_REMEMBERPOSITION:
-            if(GetMenuState(m_programMenu, ID_PROCESSING_REMEMBERPOSITION, MF_BYCOMMAND) & MF_CHECKED)
-            {
-                SaveStartingPositionState(false);
-                CheckMenuItem(m_programMenu, ID_PROCESSING_REMEMBERPOSITION, MF_UNCHECKED);
-            }
-            else
-            {
-                SaveStartingPositionState(true);
-                CheckMenuItem(m_programMenu, ID_PROCESSING_REMEMBERPOSITION, MF_CHECKED);
-            }
-            break;
-        case ID_PRESENTATION_USEFLIPMODE:
-            if(GetMenuState(m_advancedMenu, ID_PRESENTATION_USEFLIPMODE, MF_BYCOMMAND) & MF_CHECKED)
-            {
-                CheckMenuItem(m_advancedMenu, ID_PRESENTATION_USEFLIPMODE, MF_UNCHECKED);
-                SaveFlipModeState(false);
-            }
-            else
-            {
-                CheckMenuItem(m_advancedMenu, ID_PRESENTATION_USEFLIPMODE, MF_CHECKED);
-                SaveFlipModeState(true);
-            }
-            break;
-        case ID_ADVANCED_ALLOWTEARING:
-            if(GetMenuState(m_advancedMenu, ID_ADVANCED_ALLOWTEARING, MF_BYCOMMAND) & MF_CHECKED)
-            {
-                CheckMenuItem(m_advancedMenu, ID_ADVANCED_ALLOWTEARING, MF_UNCHECKED);
-                SaveTearingState(false);
-            }
-            else
-            {
-                CheckMenuItem(m_advancedMenu, ID_ADVANCED_ALLOWTEARING, MF_CHECKED);
-                SaveTearingState(true);
-            }
-            break;
-        case ID_ADVANCED_MAXCAPTUREFRAMERATE:
-            if(GetMenuState(m_advancedMenu, ID_ADVANCED_MAXCAPTUREFRAMERATE, MF_BYCOMMAND) & MF_CHECKED)
-            {
-                CheckMenuItem(m_advancedMenu, ID_ADVANCED_MAXCAPTUREFRAMERATE, MF_UNCHECKED);
-                SaveMaxCaptureRateState(false);
-            }
-            else
-            {
-                CheckMenuItem(m_advancedMenu, ID_ADVANCED_MAXCAPTUREFRAMERATE, MF_CHECKED);
-                SaveMaxCaptureRateState(true);
-            }
-            break;
-        case ID_ADVANCED_USEHDR:
-            if(GetMenuState(m_advancedMenu, ID_ADVANCED_USEHDR, MF_BYCOMMAND) & MF_CHECKED)
-            {
-                CheckMenuItem(m_advancedMenu, ID_ADVANCED_USEHDR, MF_UNCHECKED);
-                SaveUseHDRState(false);
-
-                EnableMenuItem(m_advancedMenu, ID_PRESENTATION_USEFLIPMODE, MF_BYCOMMAND | MF_ENABLED);
-
-                if(GetFlipModeState())
-                {
-                    CheckMenuItem(m_advancedMenu, ID_PRESENTATION_USEFLIPMODE, MF_CHECKED);
-                }
-                else
-                {
-                    CheckMenuItem(m_advancedMenu, ID_PRESENTATION_USEFLIPMODE, MF_UNCHECKED);
-                }
-            }
-            else
-            {
-                CheckMenuItem(m_advancedMenu, ID_ADVANCED_USEHDR, MF_CHECKED);
-                SaveUseHDRState(true);
-
-                CheckMenuItem(m_advancedMenu, ID_PRESENTATION_USEFLIPMODE, MF_BYCOMMAND | MF_CHECKED);
-                EnableMenuItem(m_advancedMenu, ID_PRESENTATION_USEFLIPMODE, MF_BYCOMMAND | MF_GRAYED);
-            }
-            break;
-        case ID_DESKTOP_LOCKINPUTAREA:
-            if(m_captureOptions.inputArea.right - m_captureOptions.inputArea.left != 0)
-            {
-                m_captureOptions.inputArea.top    = 0;
-                m_captureOptions.inputArea.left   = 0;
-                m_captureOptions.inputArea.bottom = 0;
-                m_captureOptions.inputArea.right  = 0;
-                CheckMenuItem(m_displayMenu, ID_DESKTOP_LOCKINPUTAREA, MF_UNCHECKED | MF_BYCOMMAND);
-            }
-            else
-            {
-                POINT topLeft;
-                topLeft.x = 0;
-                topLeft.y = 0;
-                ClientToScreen(hWnd, &topLeft);
-                RECT clientArea;
-                GetClientRect(hWnd, &clientArea);
-                m_captureOptions.inputArea.top    = topLeft.y;
-                m_captureOptions.inputArea.left   = topLeft.x;
-                m_captureOptions.inputArea.bottom = topLeft.y + clientArea.bottom;
-                m_captureOptions.inputArea.right  = topLeft.x + clientArea.right;
-                CheckMenuItem(m_displayMenu, ID_DESKTOP_LOCKINPUTAREA, MF_CHECKED | MF_BYCOMMAND);
-            }
-            m_captureManager.UpdateLockedArea();
-            break;
-        case IDM_PIXELSIZE_DPI:
-            if(m_captureOptions.dpiScale == m_dpiScale)
-            {
-                m_captureOptions.dpiScale = 1.0f; // disable DPI scaling
-                CheckMenuItem(m_pixelSizeMenu, IDM_PIXELSIZE_DPI, MF_UNCHECKED | MF_BYCOMMAND);
-            }
-            else
-            {
-                m_captureOptions.dpiScale = m_dpiScale; // enable DPI scaling
-                CheckMenuItem(m_pixelSizeMenu, IDM_PIXELSIZE_DPI, MF_CHECKED | MF_BYCOMMAND);
-            }
-            m_captureManager.UpdatePixelSize();
-            break;
-        case IDM_OUTPUT_FREESCALE:
-            if(!m_captureOptions.freeScale)
-            {
-                CheckMenuRadioItem(m_outputScaleMenu, WM_OUTPUT_SCALE(0), WM_OUTPUT_SCALE(static_cast<UINT>(outputScales.size() - 1)), 0, MF_BYCOMMAND);
-                CheckMenuItem(m_outputScaleMenu, IDM_OUTPUT_FREESCALE, MF_CHECKED | MF_BYCOMMAND);
-                m_captureOptions.freeScale   = true;
-                m_captureOptions.outputScale = 1.0f;
-            }
-            m_captureManager.UpdateOutputSize();
-            UpdateWindowState();
-            break;
-        case IDM_OUTPUT_LOCKSCALE:
-            if(ScaleLocked())
-            {
-                CheckMenuItem(m_outputScaleMenu, IDM_OUTPUT_LOCKSCALE, MF_UNCHECKED | MF_BYCOMMAND);
-            }
-            else
-            {
-                CheckMenuItem(m_outputScaleMenu, IDM_OUTPUT_LOCKSCALE, MF_CHECKED | MF_BYCOMMAND);
-            }
-            break;
-        case IDM_INPUT_CAPTURECURSOR:
-            if(!HasCaptureAPI())
-                break;
-            m_captureOptions.captureCursor = !m_captureOptions.captureCursor;
-            m_captureManager.UpdateCursor();
-            if(m_captureOptions.captureCursor)
-                CheckMenuItem(m_inputMenu, IDM_INPUT_CAPTURECURSOR, MF_CHECKED | MF_BYCOMMAND);
-            else
-                CheckMenuItem(m_inputMenu, IDM_INPUT_CAPTURECURSOR, MF_UNCHECKED | MF_BYCOMMAND);
-            break;
-        case IDM_SHADER_NEXT:
-            SendMessage(hWnd, WM_COMMAND, WM_SHADER((m_captureOptions.presetNo + 1) % m_numPresets), 0);
-            break;
-        case IDM_SHADER_RANDOM:
-            SendMessage(hWnd, WM_COMMAND, WM_SHADER(rand() % m_numPresets), 0);
-            break;
-        case IDM_FULLSCREEN:
-            ToggleBorderless(hWnd);
-            break;
-        case IDM_SCREENSHOT:
-            Screenshot();
-            break;
-        case IDM_PAUSE:
-            if(m_captureManager.IsActive())
-                Stop();
-            else
-                Start();
-            break;
-        case IDM_CURSOR:
-            SendMessage(hWnd, WM_COMMAND, IDM_INPUT_CAPTURECURSOR, 0);
-            break;
-        case IDM_PIXELSIZE_NEXT:
-            SendMessage(hWnd, WM_COMMAND, WM_PIXEL_SIZE((m_selectedPixelSize + 1) % pixelSizes.size()), 0);
-            break;
-        case IDM_PIXELSIZE_PREV:
-            SendMessage(hWnd, WM_COMMAND, WM_PIXEL_SIZE(((int)m_selectedPixelSize - 1 + pixelSizes.size()) % pixelSizes.size()), 0);
-            break;
-        case IDM_FLIP_HORIZONTAL:
-            m_captureOptions.flipHorizontal = !m_captureOptions.flipHorizontal;
-            if(m_captureOptions.flipHorizontal)
-                CheckMenuItem(m_flipMenu, IDM_FLIP_HORIZONTAL, MF_CHECKED | MF_BYCOMMAND);
-            else
-                CheckMenuItem(m_flipMenu, IDM_FLIP_HORIZONTAL, MF_UNCHECKED | MF_BYCOMMAND);
-            m_captureManager.UpdateOutputFlip();
-            break;
-        case IDM_FLIP_VERTICAL:
-            m_captureOptions.flipVertical = !m_captureOptions.flipVertical;
-            if(m_captureOptions.flipVertical)
-                CheckMenuItem(m_flipMenu, IDM_FLIP_VERTICAL, MF_CHECKED | MF_BYCOMMAND);
-            else
-                CheckMenuItem(m_flipMenu, IDM_FLIP_VERTICAL, MF_UNCHECKED | MF_BYCOMMAND);
-            m_captureManager.UpdateOutputFlip();
-            break;
-        case ID_ORIENTATION_HORIZONTAL:
-        case ID_ORIENTATION_VERTICAL: {
-            m_captureOptions.vertical = (wmId == ID_ORIENTATION_VERTICAL);
-            CheckMenuItem(m_orientationMenu, ID_ORIENTATION_HORIZONTAL, (m_captureOptions.vertical ? MF_UNCHECKED : MF_CHECKED) | MF_BYCOMMAND);
-            CheckMenuItem(m_orientationMenu, ID_ORIENTATION_VERTICAL, (m_captureOptions.vertical ? MF_CHECKED : MF_UNCHECKED) | MF_BYCOMMAND);
-            auto preset = m_captureOptions.presetNo;
-            if(m_captureManager.IsActive())
-            {
-                m_captureManager.RememberLastPreset();
-            }
-            m_captureManager.UpdateVertical();
-            if(m_captureManager.IsActive())
-            {
-                m_captureManager.UpdateShaderPreset();
-                m_captureManager.SetLastPreset(preset);
-                AdjustWindowSize(hWnd);
-            }
-        }
-        break;
-        case IDM_WINDOW_SOLID:
-            m_captureOptions.transparent = false;
-            if(m_captureManager.IsActive())
-            {
-                m_captureManager.UpdateCursor();
-            }
-            CheckMenuItem(m_outputWindowMenu, IDM_WINDOW_TRANSPARENT, MF_UNCHECKED | MF_BYCOMMAND);
-            CheckMenuItem(m_outputWindowMenu, IDM_WINDOW_SOLID, MF_CHECKED | MF_BYCOMMAND);
-            UpdateWindowState();
-            break;
-        case IDM_WINDOW_TRANSPARENT:
-            m_captureOptions.transparent = true;
-            if(m_captureManager.IsActive())
-            {
-                m_captureManager.UpdateCursor();
-            }
-            CheckMenuItem(m_outputWindowMenu, IDM_WINDOW_TRANSPARENT, MF_CHECKED | MF_BYCOMMAND);
-            CheckMenuItem(m_outputWindowMenu, IDM_WINDOW_SOLID, MF_UNCHECKED | MF_BYCOMMAND);
-            UpdateWindowState();
-            break;
-        case IDM_MODE_GLASS:
-            if(!HasCaptureAPI())
-                break;
-            m_captureOptions.clone = false;
-            CheckMenuItem(m_modeMenu, IDM_MODE_GLASS, MF_CHECKED | MF_BYCOMMAND);
-            CheckMenuItem(m_modeMenu, IDM_MODE_CLONE, MF_UNCHECKED | MF_BYCOMMAND);
-            m_captureOptions.transparent = true;
-            if(m_captureManager.IsActive())
-            {
-                m_captureManager.UpdateCursor();
-            }
-            CheckMenuItem(m_outputWindowMenu, IDM_WINDOW_TRANSPARENT, MF_CHECKED | MF_BYCOMMAND);
-            CheckMenuItem(m_outputWindowMenu, IDM_WINDOW_SOLID, MF_UNCHECKED | MF_BYCOMMAND);
-            TryUpdateInput();
-            UpdateWindowState();
-            break;
-        case IDM_MODE_CLONE:
-            m_captureOptions.clone = true;
-            CheckMenuItem(m_modeMenu, IDM_MODE_GLASS, MF_UNCHECKED | MF_BYCOMMAND);
-            CheckMenuItem(m_modeMenu, IDM_MODE_CLONE, MF_CHECKED | MF_BYCOMMAND);
-            m_captureOptions.transparent = false;
-            if(m_captureManager.IsActive())
-            {
-                m_captureManager.UpdateCursor();
-            }
-            CheckMenuItem(m_outputWindowMenu, IDM_WINDOW_TRANSPARENT, MF_UNCHECKED | MF_BYCOMMAND);
-            CheckMenuItem(m_outputWindowMenu, IDM_WINDOW_SOLID, MF_CHECKED | MF_BYCOMMAND);
-            TryUpdateInput();
-            UpdateWindowState();
-            break;
-        case ID_WINDOW_CROP:
-            CropWindow();
-            break;
-        /*case IDM_DISPLAY_ALLDISPLAYS:
-            CheckMenuRadioItem(
-                m_windowMenu, WM_CAPTURE_WINDOW(0), WM_CAPTURE_WINDOW(static_cast<UINT>(m_captureWindows.size())), 0, MF_BYCOMMAND);
-            CheckMenuItem(m_displayMenu, IDM_DISPLAY_ALLDISPLAYS, MF_CHECKED | MF_BYCOMMAND);
-            m_captureOptions.captureWindow = NULL;
-            if(Is1903())
-            {
-                // switch to clone mode
-                m_captureOptions.monitor     = MonitorFromWindow(hWnd, MONITOR_DEFAULTTOPRIMARY);
-                m_captureOptions.clone       = true;
-                m_captureOptions.transparent = false;
-                CheckMenuItem(m_modeMenu, IDM_MODE_GLASS, MF_UNCHECKED | MF_BYCOMMAND);
-                CheckMenuItem(m_modeMenu, IDM_MODE_CLONE, MF_CHECKED | MF_BYCOMMAND);
-                CheckMenuItem(m_outputWindowMenu, IDM_WINDOW_TRANSPARENT, MF_UNCHECKED | MF_BYCOMMAND);
-                CheckMenuItem(m_outputWindowMenu, IDM_WINDOW_SOLID, MF_CHECKED | MF_BYCOMMAND);
-            }
-            else
-            {
-                // switch to glass mode
-                m_captureOptions.clone       = false;
-                m_captureOptions.transparent = true;
-                CheckMenuItem(m_modeMenu, IDM_MODE_GLASS, MF_CHECKED | MF_BYCOMMAND);
-                CheckMenuItem(m_modeMenu, IDM_MODE_CLONE, MF_UNCHECKED | MF_BYCOMMAND);
-                CheckMenuItem(m_outputWindowMenu, IDM_WINDOW_TRANSPARENT, MF_CHECKED | MF_BYCOMMAND);
-                CheckMenuItem(m_outputWindowMenu, IDM_WINDOW_SOLID, MF_UNCHECKED | MF_BYCOMMAND);
-            }
-            m_captureManager.UpdateInput();
-            UpdateWindowState();
-            break;*/
-        case IDM_STOP:
-            SetTimer(m_mainWindow, IDM_STOP, MENU_FADE_DELAY, NULL);
-            break;
-        case IDM_PROCESSING_LOADPROFILE:
-            LoadProfile();
-            break;
-        case ID_SHADER_IMPORT:
-            ImportShader();
-            break;
-        case IDM_PROCESSING_SAVEPROFILEAS:
-            SaveProfile();
-            break;
-        case IDM_EXIT:
-            m_captureManager.StopSession();
-            DestroyWindow(hWnd);
-            break;
-        case IDM_ACTIVE:
-            SendMessage(hWnd, WM_COMMAND, ID_QUICK_TOGGLE, m_toggledNone ? 2 : 1);
-            break;
-        case ID_QUICK_TOGGLE: {
-            bool isChecked = GetMenuState(m_shaderMenu, ID_QUICK_TOGGLE, MF_BYCOMMAND) & MF_CHECKED;
-            if(lParam == 1 || (lParam == 0 && isChecked)) // down/disable
-            {
-                if(!m_toggledNone)
-                {
-                    m_toggledNone     = true;
-                    m_toggledPresetNo = m_captureOptions.presetNo;
-                    m_captureManager.RememberLastPreset();
-                    SendMessage(hWnd, WM_COMMAND, WM_SHADER(0), 1);
-                    CheckMenuItem(m_shaderMenu, ID_QUICK_TOGGLE, MF_UNCHECKED | MF_BYCOMMAND);
-                }
-            }
-            else if(lParam == 2 || (lParam == 0 && !isChecked)) // up/enable
-            {
-                if(m_toggledNone)
-                {
-                    m_toggledNone = false;
-                    m_captureManager.SetLastPreset(m_toggledPresetNo);
-                    SendMessage(hWnd, WM_COMMAND, WM_SHADER(m_toggledPresetNo), 1);
-                    CheckMenuItem(m_shaderMenu, ID_QUICK_TOGGLE, MF_CHECKED | MF_BYCOMMAND);
-                }
-            }
-        }
-        break;
-        case ID_FPS_REMEMBERFPS:
-            if(GetMenuState(m_frameSkipMenu, ID_FPS_REMEMBERFPS, MF_BYCOMMAND) & MF_CHECKED)
-            {
-                CheckMenuItem(m_frameSkipMenu, ID_FPS_REMEMBERFPS, MF_UNCHECKED);
-                SaveRememberFPS(-1); // forget
-            }
-            else
-            {
-                CheckMenuItem(m_frameSkipMenu, ID_FPS_REMEMBERFPS, MF_CHECKED);
-                SaveRememberFPS(m_captureOptions.frameSkip);
-            }
-            break;
-        case IDM_ABOUT1:
-        case IDM_ABOUT2:
-        case IDM_ABOUT3:
-#ifdef _DEBUG
-            m_captureManager.Debug();
-#else
-            ShellExecute(0, 0, L"https://github.com/mausimus/ShaderGlass", 0, 0, SW_SHOW);
-#endif
-            break;
-        case ID_HELP_README:
-            ShellExecute(0, 0, L"https://mausimus.github.io/ShaderGlass/MANUAL.html", 0, 0, SW_SHOW);
-            break;
-        case ID_HELP_FREQUENTLYASKEDQUESTIONS:
-            ShellExecute(0, 0, L"https://github.com/mausimus/ShaderGlass/blob/master/FAQ.md", 0, 0, SW_SHOW);
-            break;
-        case ID_GLOBALHOTKEYS_FULLSCREEN:
-        case ID_GLOBALHOTKEYS_SCREENSHOT:
-        case ID_GLOBALHOTKEYS_PAUSE:
-        case ID_GLOBALHOTKEYS_ACTIVE:
-        case ID_GLOBALHOTKEYS_SHOWMENU:
-        case ID_GLOBALHOTKEYS_CURSOR: {
-            auto globalState = GetHotkeyState();
-            if(globalState)
-            {
-                UnregisterHotkeys();
-            }
-
-            auto& hk = m_hotkeys.at(wmId);
-            StartDialog();
-            hk.currentKey = m_hotkeyDialog->GetHotkey(hk.name, hk.currentKey);
-            EndDialog();
-            SaveHotkey(hk);
-            UpdateHotkey(hk, globalState);
-
-            if(globalState)
-            {
-                RegisterHotkeys();
-            }
-        }
-        break;
-        default:
-            if(wmId >= WM_USER && wmId <= 0x7FFF)
-            {
-                if(wmId >= WM_SHADER(0) && wmId < WM_SHADER(MAX_SHADERS))
-                {
-                    PostMessage(m_browserWindow, WM_COMMAND, WM_USER, wmId + (lParam << 16));
-                    m_captureOptions.presetNo = wmId - WM_SHADER(0);
-                    m_captureManager.UpdateShaderPreset();
-                    UpdateWindowState();
-                    if(wmId != WM_SHADER(0) && m_toggledNone)
-                    {
-                        m_toggledNone = false;
-                        CheckMenuItem(m_shaderMenu, ID_QUICK_TOGGLE, MF_CHECKED | MF_BYCOMMAND);
-                    }
-                    break;
-                }
-                if(wmId >= WM_CAPTURE_WINDOW(0) && wmId < WM_CAPTURE_WINDOW(MAX_CAPTURE_WINDOWS))
-                {
-                    if(!HasCaptureAPI() && !HasCaptureLib())
-                        break;
-                    CheckMenuRadioItem(m_windowMenu, WM_CAPTURE_WINDOW(0), WM_CAPTURE_WINDOW(static_cast<UINT>(m_captureWindows.size())), wmId, MF_BYCOMMAND);
-                    CheckMenuRadioItem(m_displayMenu, WM_CAPTURE_DISPLAY(0), WM_CAPTURE_DISPLAY(static_cast<UINT>(m_captureDisplays.size())), 0, MF_BYCOMMAND);
-                    m_captureOptions.captureWindow = m_captureWindows.at(wmId - WM_CAPTURE_WINDOW(0)).hwnd;
-                    m_captureOptions.monitor       = NULL;
-                    m_captureOptions.clone         = true;
-                    m_captureOptions.transparent   = false;
-                    CheckMenuItem(m_modeMenu, IDM_MODE_GLASS, MF_UNCHECKED | MF_BYCOMMAND);
-                    CheckMenuItem(m_modeMenu, IDM_MODE_CLONE, MF_CHECKED | MF_BYCOMMAND);
-                    CheckMenuItem(m_outputWindowMenu, IDM_WINDOW_TRANSPARENT, MF_UNCHECKED | MF_BYCOMMAND);
-                    CheckMenuItem(m_outputWindowMenu, IDM_WINDOW_SOLID, MF_CHECKED | MF_BYCOMMAND);
-                    CheckMenuItem(m_inputMenu, ID_INPUT_FILE, MF_UNCHECKED | MF_BYCOMMAND);
-                    EnableMenuItem(m_outputScaleMenu, IDM_OUTPUT_FREESCALE, MF_BYCOMMAND | MF_ENABLED);
-                    EnableMenuItem(m_inputMenu, ID_WINDOW_CROP, MF_BYCOMMAND | MF_ENABLED);
-                    m_captureOptions.imageFile.clear();
-                    m_captureOptions.deviceFormatNo = 0;
-                    if(m_captureManager.IsActive())
-                    {
-                        m_captureManager.UpdateCursor();
-                    }
-                    TryUpdateInput();
-                    if(!m_captureManager.IsActive() && !HasCaptureAPI() && HasCaptureLib())
-                    {
-                        Start();
-                    }
-                    UpdateWindowState();
-                    if(HasCaptureAPI())
-                    {
-                        SetFreeScale();
-                    }
-                    break;
-                }
-                if(wmId >= WM_CAPTURE_DISPLAY(0) && wmId < WM_CAPTURE_DISPLAY(MAX_CAPTURE_DISPLAYS))
-                {
-                    if(!HasCaptureAPI() && !HasCaptureLib())
-                        break;
-                    CheckMenuRadioItem(m_windowMenu, WM_CAPTURE_WINDOW(0), WM_CAPTURE_WINDOW(static_cast<UINT>(m_captureWindows.size())), 0, MF_BYCOMMAND);
-                    CheckMenuRadioItem(m_displayMenu, WM_CAPTURE_DISPLAY(0), WM_CAPTURE_DISPLAY(static_cast<UINT>(m_captureDisplays.size())), wmId, MF_BYCOMMAND);
-                    m_captureOptions.captureWindow = NULL;
-                    m_captureOptions.monitor       = m_captureDisplays.at(wmId - WM_CAPTURE_DISPLAY(0)).monitor;
-                    m_captureOptions.clone         = false;
-                    m_captureOptions.transparent   = HasCaptureAPI();
-                    if(m_captureOptions.freeScale)
-                    {
-                        CheckMenuItem(m_outputScaleMenu, IDM_OUTPUT_FREESCALE, MF_UNCHECKED | MF_BYCOMMAND);
-                        m_captureOptions.freeScale   = false;
-                        m_captureOptions.outputScale = 1.0f;
-                        for(const auto& p : outputScales)
-                        {
-                            if(m_captureOptions.outputScale == p.second.s)
-                                CheckMenuItem(m_outputScaleMenu, p.first, MF_CHECKED | MF_BYCOMMAND);
-                        }
-                    }
-                    CheckMenuItem(m_modeMenu, IDM_MODE_GLASS, MF_CHECKED | MF_BYCOMMAND);
-                    CheckMenuItem(m_modeMenu, IDM_MODE_CLONE, MF_UNCHECKED | MF_BYCOMMAND);
-                    CheckMenuItem(m_outputWindowMenu, IDM_WINDOW_TRANSPARENT, MF_CHECKED | MF_BYCOMMAND);
-                    CheckMenuItem(m_outputWindowMenu, IDM_WINDOW_SOLID, MF_UNCHECKED | MF_BYCOMMAND);
-                    CheckMenuItem(m_inputMenu, ID_INPUT_FILE, MF_UNCHECKED | MF_BYCOMMAND);
-                    EnableMenuItem(m_outputScaleMenu, IDM_OUTPUT_FREESCALE, MF_BYCOMMAND | MF_DISABLED | MF_GRAYED);
-                    EnableMenuItem(m_inputMenu, ID_WINDOW_CROP, MF_BYCOMMAND | MF_DISABLED | MF_GRAYED);
-                    m_captureOptions.imageFile.clear();
-                    m_captureOptions.deviceFormatNo = 0;
-                    if(m_captureManager.IsActive())
-                    {
-                        m_captureManager.UpdateCursor();
-                    }
-                    TryUpdateInput();
-                    if(!m_captureManager.IsActive() && !HasCaptureAPI() && HasCaptureLib())
-                    {
-                        Start();
-                    }
-                    UpdateWindowState();
-                    break;
-                }
-                const auto& pixelSize = pixelSizes.find(wmId);
-                if(pixelSize != pixelSizes.end())
-                {
-                    m_selectedPixelSize = wmId - WM_PIXEL_SIZE(0);
-                    CheckMenuRadioItem(m_pixelSizeMenu, WM_PIXEL_SIZE(0), WM_PIXEL_SIZE(static_cast<UINT>(pixelSizes.size() - 1)), wmId, MF_BYCOMMAND);
-                    m_captureOptions.pixelWidth  = pixelSize->second.w;
-                    m_captureOptions.pixelHeight = pixelSize->second.h;
-                    m_captureManager.UpdatePixelSize();
-                    UpdateWindowState();
-                    SendMessage(m_browserWindow, WM_COMMAND, WM_USER + 2, m_selectedPixelSize);
-                    break;
-                }
-                const auto& outputScale = outputScales.find(wmId);
-                if(outputScale != outputScales.end())
-                {
-                    m_selectedOutputScale = wmId - WM_OUTPUT_SCALE(0);
-                    CheckMenuRadioItem(m_outputScaleMenu, WM_OUTPUT_SCALE(0), WM_OUTPUT_SCALE(static_cast<UINT>(outputScales.size() - 1)), wmId, MF_BYCOMMAND);
-                    CheckMenuItem(m_outputScaleMenu, IDM_OUTPUT_FREESCALE, MF_UNCHECKED | MF_BYCOMMAND);
-                    m_captureOptions.outputScale = outputScale->second.s;
-                    m_captureOptions.freeScale   = false;
-                    m_captureManager.UpdateOutputSize();
-                    UpdateWindowState();
-                    break;
-                }
-                const auto& aspectRatio = aspectRatios.find(wmId);
-                if(aspectRatio != aspectRatios.end())
-                {
-                    if(aspectRatio->second.mnemonic == CUSTOM_MNEMONIC)
-                    {
-                        if(lParam != 0)
-                        {
-                            // loading profile?
-                            aspectRatio->second.r = lParam / (float)CUSTOM_PARAM_SCALE;
-                        }
-                        else
-                        {
-                            StartDialog();
-                            float customInput = m_inputDialog->GetInput("Aspect Ratio Correction (Pixel Height):", aspectRatio->second.r);
-                            EndDialog();
-                            if(std::isnan(customInput))
-                                break;
-
-                            aspectRatio->second.r = customInput; // store new ratio in menu item
-                        }
-                    }
-
-                    m_selectedAspectRatio = wmId - WM_ASPECT_RATIO(0);
-                    CheckMenuRadioItem(m_aspectRatioMenu, 0, static_cast<UINT>(aspectRatios.size()), wmId - WM_ASPECT_RATIO(0), MF_BYPOSITION);
-                    m_captureOptions.aspectRatio = aspectRatio->second.r;
-                    m_captureManager.UpdateOutputSize();
-                    UpdateWindowState();
-                    break;
-                }
-                const auto& frameSkip = frameSkips.find(wmId);
-                if(frameSkip != frameSkips.end())
-                {
-                    m_selectedFrameSkip = wmId - WM_FRAME_SKIP(0);
-                    CheckMenuRadioItem(m_frameSkipMenu, 1, static_cast<UINT>(frameSkips.size() + 1), wmId - WM_FRAME_SKIP(0) + 1, MF_BYPOSITION);
-                    m_captureOptions.frameSkip = frameSkip->second.s;
-                    m_captureManager.UpdateFrameSkip();
-                    if(RememberFPS())
-                    {
-                        SaveRememberFPS(m_captureOptions.frameSkip);
-                    }
-                    break;
-                }
-                if(wmId >= WM_RECENT_PROFILE(0) && wmId < WM_RECENT_PROFILE(MAX_RECENT_PROFILES))
-                {
-                    auto profileId = wmId - WM_RECENT_PROFILE(0);
-                    if(profileId < m_recentProfiles.size())
-                    {
-                        auto path = m_recentProfiles.at(profileId);
-                        if(!LoadProfile(path))
-                        {
-                            RemoveRecentProfile(path);
-                        }
-                    }
-                    break;
-                }
-                if(wmId >= WM_RECENT_IMPORT(0) && wmId < WM_RECENT_IMPORT(MAX_RECENT_IMPORTS))
-                {
-                    auto importId = wmId - WM_RECENT_IMPORT(0);
-                    if(importId < m_recentImports.size())
-                    {
-                        auto path = m_recentImports.at(importId);
-                        if(!ImportShader(path, false))
-                        {
-                            RemoveRecentImport(path);
-                        }
-                    }
-                    break;
-                }
-                if(wmId >= WM_CAPTURE_DEVICE_FORMAT(0) && wmId < WM_CAPTURE_DEVICE_FORMAT(MAX_CAPTURE_DEVICE_FORMATS))
-                {
-                    auto deviceFormatNo = wmId - WM_CAPTURE_DEVICE_FORMAT(0);
-                    auto setDefaults    = lParam == 0 && (m_captureOptions.deviceFormatNo == 0);
-                    m_captureOptions.imageFile.clear();
-                    m_captureOptions.deviceFormatNo = deviceFormatNo;
-                    CheckMenuItem(m_inputMenu, ID_INPUT_FILE, MF_UNCHECKED | MF_BYCOMMAND);
-
-                    StartImage(setDefaults, setDefaults ? WM_PIXEL_SIZE(3) : 0);
-                    break;
-                }
-            }
-            return DefWindowProc(hWnd, message, wParam, lParam);
-        }
-    }
-    break;
-    case WM_USER_CROP_UPDATED: {
-        switch(wParam)
-        {
-        case 0:
-            m_captureOptions.croppedArea.top = (LONG)lParam;
-            break;
-        case 1:
-            m_captureOptions.croppedArea.right = (LONG)lParam;
-            break;
-        case 2:
-            m_captureOptions.croppedArea.bottom = (LONG)lParam;
-            break;
-        case 3:
-            m_captureOptions.croppedArea.left = (LONG)lParam;
-            break;
-        case 4:
-            m_captureOptions.croppedArea = RECT {0, 0, 0, 0};
-            break;
-        }
-        m_captureManager.UpdateCroppedArea();
-        AdjustWindowSize(hWnd);
-    }
-    break;
-    case WM_HOTKEY: {
-        switch(wParam)
-        {
-        case ID_GLOBALHOTKEYS_FULLSCREEN:
-            ToggleBorderless(hWnd);
-            break;
-        case ID_GLOBALHOTKEYS_SCREENSHOT:
-            Screenshot();
-            break;
-        case ID_GLOBALHOTKEYS_ACTIVE:
-            SendMessage(hWnd, WM_COMMAND, IDM_ACTIVE, 0);
-            break;
-        case ID_GLOBALHOTKEYS_SHOWMENU:
-            SendMessage(hWnd, WM_COMMAND, IDM_TOGGLEMENU, 0);
-            break;
-        case ID_GLOBALHOTKEYS_PAUSE:
-            if(m_captureManager.IsActive())
-                Stop();
-            else
-                Start();
-            break;
-        case ID_GLOBALHOTKEYS_CURSOR:
-            SendMessage(hWnd, WM_COMMAND, IDM_INPUT_CAPTURECURSOR, 0);
-            break;
-        }
-
-        break;
-    }
-    case WM_KEYDOWN:
-        if(wParam == VK_TAB)
-        {
-            SendMessage(hWnd, WM_COMMAND, ID_QUICK_TOGGLE, 1);
-        }
-        break;
-    case WM_KEYUP:
-        if(wParam == VK_TAB)
-        {
-            SendMessage(hWnd, WM_COMMAND, ID_QUICK_TOGGLE, 2);
-        }
-        break;
-    case WM_SIZE: {
-        switch(wParam)
-        {
-        case SIZE_MINIMIZED:
-            if(m_captureManager.IsActive() && !(m_captureOptions.captureWindow && !HasCaptureAPI() && HasCaptureLib()))
-            {
-                m_captureOptions.paused = true;
-                m_captureManager.StopSession();
-            }
-            break;
-        case SIZE_MAXIMIZED:
-        case SIZE_RESTORED:
-            if(m_captureOptions.paused)
-            {
-                if(m_captureManager.StartSession())
-                {
-                    UpdateGPUName();
-                    m_captureOptions.paused = false;
-                }
-            }
-            break;
-        }
-        //SendMessage(hWnd, WM_PRINT, (WPARAM)NULL, PRF_NONCLIENT); -- not sure what bug this was
-        AdjustWindowSize(hWnd);
-        return 0;
-    }
-    case WM_USER_FIRST_FRAME:
-        AdjustWindowSize(hWnd);
-        SetFreeScale();
-        return 0;
-    case WM_ERASEBKGND:
-    case WM_SIZING: {
-        // prevent flicker
-        return 0;
-    }
-    case WM_LBUTTONDOWN: {
-        if(m_captureManager.IsActive() && m_captureOptions.captureWindow)
-        {
-            // if we click in our client area, active the captured window
-            SetForegroundWindow(m_captureOptions.captureWindow);
-        }
-        break;
-    }
-    case WM_ENTERMENULOOP:
-        m_inMenu = true;
-        break;
-    case WM_EXITMENULOOP:
-        m_inMenu = false;
-        break;
-    case WM_PAINT: {
-        if(m_firstPaint)
-        {
-            m_firstPaint = false;
-            if(!m_captureManager.IsActive())
-            {
-                PAINTSTRUCT ps;
-                HDC         hdc    = BeginPaint(hWnd, &ps);
-                HBRUSH      hBrush = CreateSolidBrush(RGB(64, 64, 64));
-                FillRect(hdc, &ps.rcPaint, hBrush);
-                DeleteObject(hBrush);
-                EndPaint(hWnd, &ps);
-                break;
-            }
-        }
-        if(m_captureManager.IsActive() && m_captureOptions.transparent)
-        {
-            POINT p;
-            if(GetCursorPos(&p))
-            {
-                int cx = p.x;
-                int cy = p.y;
-                if(ScreenToClient(hWnd, &p))
-                {
-                    RECT r;
-                    GetClientRect(hWnd, &r);
-                    if(p.x >= 0 && p.x < r.right && p.y >= 0 && p.y < r.bottom)
-                    {
-                        SetTransparent(true);
-                        // TODO: check if mouse over parameters or browser window while they are visible? or is focus enough
-                        auto focusedWindow = GetForegroundWindow();
-                        if(!m_inMenu && !m_inDialog && focusedWindow != m_browserWindow && focusedWindow != m_paramsWindow)
-                            m_captureManager.HideCursor();
-                        else
-                            m_captureManager.ShowCursor();
-                    }
-                    else
-                    {
-                        GetWindowRect(hWnd, &r);
-                        if(cx >= r.left && cx < r.right && cy >= r.top && cy < r.bottom)
-                        {
-                            // we are in border/menus, make sure we can interact
-                            SetTransparent(false);
-                        }
-                        else
-                        {
-                            // prevent other windows assuming they are occluded
-                            SetTransparent(true);
-                        }
-
-                        m_captureManager.ShowCursor();
-                    }
-                }
-            }
-        }
-        ValidateRect(hWnd, NULL);
-        return 0;
-    }
-
-    case WM_INITMENUPOPUP: {
-        if(wParam == (WPARAM)m_deviceMenu)
-        {
-            ScanDevices();
-        }
-        else if(wParam == (WPARAM)m_windowMenu)
-        {
-            ScanWindows();
-        }
-    }
-    break;
-    case WM_TIMER:
-        switch(wParam)
-        {
-        case IDM_STOP:
-            KillTimer(m_mainWindow, IDM_STOP);
-            Stop();
-            return 0;
-        case ID_PROCESSING_SCREENSHOT:
-            KillTimer(m_mainWindow, ID_PROCESSING_SCREENSHOT);
-            Screenshot();
-            return 0;
-        case TIMER_TITLE:
-            UpdateTitle();
-            return 0;
-        }
-        break;
-    case WM_DESTROY:
-        m_captureManager.Exit();
-        SaveStartingPosition();
-        PostQuitMessage(0);
-        break;
-    default:
-        return DefWindowProc(hWnd, message, wParam, lParam);
-    }
-    return 0;
-}
-
-bool ShaderWindow::Start()
-{
-    if(m_captureOptions.captureWindow && !IsWindow(m_captureOptions.captureWindow) && m_captureOptions.captureWindow != HWND_BROADCAST)
-        return false;
-
-    if(m_captureManager.IsActive())
-        return false;
-
-    if(m_captureManager.StartSession())
-    {
-        EnableMenuItem(m_programMenu, IDM_START, MF_BYCOMMAND | MF_DISABLED | MF_GRAYED);
-        EnableMenuItem(m_programMenu, IDM_STOP, MF_BYCOMMAND | MF_ENABLED);
-        UpdateGPUName();
-        m_firstStart = false;
-    }
-    else
-    {
-        EnableMenuItem(m_programMenu, IDM_START, MF_BYCOMMAND | MF_ENABLED);
-        EnableMenuItem(m_programMenu, IDM_STOP, MF_BYCOMMAND | MF_DISABLED | MF_GRAYED);
-    }
-    UpdateWindowState();
-
-    return true;
-}
-
-void ShaderWindow::Stop()
-{
-    if(!m_captureManager.IsActive())
-        return;
-
-    m_captureManager.StopSession();
-    EnableMenuItem(m_programMenu, IDM_STOP, MF_BYCOMMAND | MF_DISABLED | MF_GRAYED);
-    EnableMenuItem(m_programMenu, IDM_START, MF_BYCOMMAND | MF_ENABLED);
-    UpdateWindowState();
-    SendMessage(m_paramsWindow, WM_COMMAND, IDM_UPDATE_PARAMS, 0);
-}
-
-void ShaderWindow::TryUpdateInput()
-{
-    if(!m_captureManager.UpdateInput())
-    {
-        EnableMenuItem(m_programMenu, IDM_START, MF_BYCOMMAND | MF_ENABLED);
-        EnableMenuItem(m_programMenu, IDM_STOP, MF_BYCOMMAND | MF_DISABLED | MF_GRAYED);
-    }
-}
-
-void ShaderWindow::Screenshot()
-{
-    m_captureManager.GrabOutput();
-
-    OPENFILENAME ofn;
-    wchar_t      szFile[MAX_PATH] = L"";
-
-    ZeroMemory(&ofn, sizeof(ofn));
-    ofn.lStructSize     = sizeof(ofn);
-    ofn.hwndOwner       = m_mainWindow;
-    ofn.lpstrFile       = szFile;
-    ofn.nMaxFile        = MAX_PATH;
-    ofn.lpstrFilter     = _T("PNG\0*.png\0");
-    ofn.lpstrDefExt     = _T("png");
-    ofn.nFilterIndex    = 1;
-    ofn.lpstrFileTitle  = NULL;
-    ofn.nMaxFileTitle   = 0;
-    ofn.lpstrInitialDir = NULL;
-    ofn.Flags           = OFN_PATHMUSTEXIST;
-
-    StartDialog();
-    if(GetSaveFileName(&ofn) == TRUE)
-    {
-        m_captureManager.SaveOutput(ofn.lpstrFile);
-    }
-    EndDialog();
-}
-
-void ShaderWindow::ToggleBorderless(HWND hWnd)
-{
-    LONG cur_style = GetWindowLong(m_mainWindow, GWL_STYLE);
-    if(!m_isBorderless)
-    {
-        cur_style &= ~WS_OVERLAPPEDWINDOW;
-        SetMenu(hWnd, NULL);
-    }
-    else
-    {
-        cur_style |= WS_OVERLAPPEDWINDOW;
-        SetMenu(hWnd, m_mainMenu);
-    }
-    SetWindowLong(m_mainWindow, GWL_STYLE, cur_style);
-
-    m_isBorderless = !m_isBorderless;
-
-    if(m_isBorderless)
-    {
-        RECT        clientRect;
-        auto        monitor = MonitorFromWindow(hWnd, MONITOR_DEFAULTTONEAREST);
-        MONITORINFO info;
-        info.cbSize = sizeof(info);
-        GetMonitorInfo(monitor, &info);
-        clientRect.top    = info.rcMonitor.top;
-        clientRect.left   = info.rcMonitor.left;
-        clientRect.right  = info.rcMonitor.right;
-        clientRect.bottom = info.rcMonitor.bottom;
-        AdjustWindowRect(&clientRect, GetWindowLong(hWnd, GWL_STYLE), GetMenu(hWnd) != 0);
-
-        GetWindowRect(hWnd, &m_lastPosition);
-        SetWindowPos(hWnd, HWND_TOPMOST, info.rcMonitor.left, info.rcMonitor.top, clientRect.right - clientRect.left, clientRect.bottom - clientRect.top, 0);
-    }
-    else
-    {
-        SetWindowPos(hWnd,
-                     0,
-                     m_lastPosition.left,
-                     m_lastPosition.top,
-                     m_lastPosition.right - m_lastPosition.left,
-                     m_lastPosition.bottom - m_lastPosition.top,
-                     SWP_NOZORDER | SWP_NOOWNERZORDER);
-    }
-}
-
-bool ShaderWindow::Create(_In_ HINSTANCE hInstance, _In_ int nCmdShow)
-{
-    LoadStringW(hInstance, IDS_APP_TITLE, m_title, MAX_LOADSTRING);
-    LoadStringW(hInstance, IDC_SHADERGLASS, m_windowClass, MAX_LOADSTRING);
-    MyRegisterClass(hInstance);
-    if(!InitInstance(hInstance, nCmdShow))
-    {
-        return FALSE;
-    }
-
-    m_captureManager.Initialize();
-
-    m_mainMenu = LoadMenu(hInstance, MAKEINTRESOURCEW(IDC_SHADERGLASS));
-
-    m_programMenu = GetSubMenu(m_mainMenu, 0);
-    m_shaderMenu  = GetSubMenu(m_mainMenu, 3);
-    m_helpMenu    = GetSubMenu(m_mainMenu, 4);
-    BuildProgramMenu();
-    BuildInputMenu();
-    BuildOutputMenu();
-    BuildShaderMenu();
-    ScanDisplays();
-
-    if(!HasCaptureAPI())
-    {
-        if(!HasCaptureLib())
-        {
-            ModifyMenu(
-                m_helpMenu, ID_HELP_WINDOWSVERSION, MF_BYCOMMAND | MF_STRING | MF_DISABLED | MF_GRAYED, ID_HELP_WINDOWSVERSION, L"No Capture API! Only file input is possible.");
-            EnableMenuItem(m_inputMenu, 0, MF_BYPOSITION | MF_DISABLED | MF_GRAYED);
-            EnableMenuItem(m_inputMenu, 1, MF_BYPOSITION | MF_DISABLED | MF_GRAYED);
-            EnableMenuItem(m_modeMenu, IDM_MODE_CLONE, MF_DISABLED | MF_BYCOMMAND | MF_GRAYED);
-        }
-        else
-        {
-            ModifyMenu(m_inputMenu, 0, MF_BYPOSITION | MF_DISABLED | MF_GRAYED | MF_SEPARATOR, 0, L"Not supported");
-            ModifyMenu(m_inputMenu, 1, MF_BYPOSITION, 1, L"Desktop/Window");
-            ModifyMenu(
-                m_helpMenu, ID_HELP_WINDOWSVERSION, MF_BYCOMMAND | MF_STRING | MF_DISABLED | MF_GRAYED, ID_HELP_WINDOWSVERSION, L"Non-Windows API - Glass mode not supported.");
-        }
-        EnableMenuItem(m_inputMenu, IDM_INPUT_CAPTURECURSOR, MF_BYCOMMAND | MF_DISABLED | MF_GRAYED);
-        EnableMenuItem(m_modeMenu, IDM_MODE_GLASS, MF_DISABLED | MF_BYCOMMAND | MF_GRAYED);
-    }
-    else if(Is1903())
-    {
-        ModifyMenu(m_helpMenu,
-                   ID_HELP_WINDOWSVERSION,
-                   MF_BYCOMMAND | MF_STRING | MF_DISABLED | MF_GRAYED,
-                   ID_HELP_WINDOWSVERSION,
-                   L"Limited functionality, update to Windows 10 May 2020 Update (2004)!");
-    }
-
-    if(CanDisableBorder())
-    {
-        CheckMenuItem(m_inputMenu, IDM_INPUT_REMOVEBORDER, MF_CHECKED | MF_BYCOMMAND);
-
-        ModifyMenu(m_helpMenu, ID_HELP_WINDOWSVERSION, MF_BYCOMMAND | MF_STRING | MF_DISABLED | MF_GRAYED, ID_HELP_WINDOWSVERSION, L"Excellent functionality, Windows 11");
-    }
-
-    SetMenu(m_mainWindow, m_mainMenu);
-    srand(static_cast<unsigned>(time(NULL)));
-    auto hotkeyState = GetHotkeyState();
-    LoadHotkeys();
-    UpdateHotkeys(hotkeyState);
-    if(hotkeyState)
-    {
-        RegisterHotkeys();
-    }
-    else
-    {
-        CheckMenuItem(m_hotkeysMenu, ID_GLOBALHOTKEYS_ENABLE, MF_BYCOMMAND | MF_UNCHECKED);
-    }
-    if(GetUseHDRState())
-    {
-        CheckMenuItem(m_advancedMenu, ID_ADVANCED_USEHDR, MF_BYCOMMAND | MF_CHECKED);
-        m_captureOptions.useHDR = true;
-
-        CheckMenuItem(m_advancedMenu, ID_PRESENTATION_USEFLIPMODE, MF_BYCOMMAND | MF_CHECKED);
-        EnableMenuItem(m_advancedMenu, ID_PRESENTATION_USEFLIPMODE, MF_BYCOMMAND | MF_GRAYED);
-        m_captureOptions.flipMode = true;
-    }
-    else if(GetFlipModeState())
-    {
-        EnableMenuItem(m_advancedMenu, ID_PRESENTATION_USEFLIPMODE, MF_BYCOMMAND | MF_ENABLED);
-        CheckMenuItem(m_advancedMenu, ID_PRESENTATION_USEFLIPMODE, MF_BYCOMMAND | MF_CHECKED);
-        m_captureOptions.flipMode = true;
-    }
-    if(GetTearingState())
-    {
-        CheckMenuItem(m_advancedMenu, ID_ADVANCED_ALLOWTEARING, MF_BYCOMMAND | MF_CHECKED);
-        m_captureOptions.allowTearing = true;
-    }
-    if(GetStartingPositionState())
-    {
-        CheckMenuItem(m_programMenu, ID_PROCESSING_REMEMBERPOSITION, MF_BYCOMMAND | MF_CHECKED);
-    }
-    if(RememberFPS())
-    {
-        CheckMenuItem(m_frameSkipMenu, ID_FPS_REMEMBERFPS, MF_BYCOMMAND | MF_CHECKED);
-    }
-    if(CanSetCaptureRate())
-    {
-        if(GetMaxCaptureRateState())
-        {
-            CheckMenuItem(m_advancedMenu, ID_ADVANCED_MAXCAPTUREFRAMERATE, MF_BYCOMMAND | MF_CHECKED);
-            m_captureOptions.maxCaptureRate = true;
-        }
-    }
-    else
-    {
-        ModifyMenu(
-            m_advancedMenu, ID_ADVANCED_MAXCAPTUREFRAMERATE, MF_BYCOMMAND | MF_STRING | MF_DISABLED | MF_GRAYED, ID_ADVANCED_MAXCAPTUREFRAMERATE, L"Max Capture Rate (Win11 24H2)");
-    }
-
-    m_captureOptions.monitor      = nullptr;
-    m_captureOptions.outputWindow = m_mainWindow;
-
-    if(!LoadDefault())
-    {
-        // set defaults
-        SendMessage(m_mainWindow, WM_COMMAND, WM_PIXEL_SIZE(3), 0);
-        SendMessage(m_mainWindow, WM_COMMAND, WM_ASPECT_RATIO(0), 0);
-        auto defaultNo = m_captureManager.FindByName(defaultPreset);
-        if(defaultNo != -1)
-        {
-            SendMessage(m_mainWindow, WM_COMMAND, WM_SHADER(defaultNo), 0);
-        }
-        if(RememberFPS())
-        {
-            SendMessage(m_mainWindow, WM_COMMAND, WM_FRAME_SKIP(GetRememberFPS()), 0);
-        }
-        else
-        {
-            SendMessage(m_mainWindow, WM_COMMAND, WM_FRAME_SKIP(0), 0);
-        }
-        SendMessage(m_mainWindow, WM_COMMAND, WM_OUTPUT_SCALE(0), 0);
-        if(HasCaptureAPI())
-        {
-            SendMessage(m_mainWindow, WM_COMMAND, WM_CAPTURE_DISPLAY(0), 0);
-            SendMessage(m_mainWindow, WM_COMMAND, Is1903() ? IDM_MODE_CLONE : IDM_MODE_GLASS, 0);
-        }
-        else
-        {
-            if(HasCaptureLib())
-            {
-                ScanWindows();
-                //SendMessage(m_mainWindow, WM_COMMAND, WM_CAPTURE_WINDOW(0), 0);
-            }
-            else
-            {
-                SendMessage(m_mainWindow, WM_COMMAND, IDM_MODE_CLONE, 0);
-            }
-        }
-    }
-    return TRUE;
-}
-
-void ShaderWindow::SaveRegistryOption(const wchar_t* name, bool state)
-{
-    HKEY  hkey;
-    DWORD dwDisposition;
-    if(RegCreateKeyEx(HKEY_CURRENT_USER, TEXT("Software\\ShaderGlass"), 0, NULL, 0, KEY_WRITE | KEY_SET_VALUE, NULL, &hkey, &dwDisposition) == ERROR_SUCCESS)
-    {
-        DWORD size  = sizeof(DWORD);
-        DWORD value = state ? 1 : 0;
-        RegSetValueEx(hkey, name, 0, REG_DWORD, (PBYTE)&value, size);
-        RegCloseKey(hkey);
-    }
-}
-
-bool ShaderWindow::GetRegistryOption(const wchar_t* name, bool default)
-{
-    HKEY hKey;
-    if(RegOpenKeyEx(HKEY_CURRENT_USER, TEXT("Software\\ShaderGlass"), 0, KEY_QUERY_VALUE, &hKey) == ERROR_SUCCESS)
-    {
-        DWORD value = (default ? 1 : 0);
-        DWORD size  = sizeof(DWORD);
-        RegGetValue(hKey, NULL, name, RRF_RT_REG_DWORD, NULL, &value, &size);
-        RegCloseKey(hKey);
-        return value == 1;
-    }
-
-    return default;
-}
-
-void ShaderWindow::SaveRegistryInt(const wchar_t* name, int value)
-{
-    HKEY  hkey;
-    DWORD dwDisposition;
-    if(RegCreateKeyEx(HKEY_CURRENT_USER, TEXT("Software\\ShaderGlass"), 0, NULL, 0, KEY_WRITE | KEY_SET_VALUE, NULL, &hkey, &dwDisposition) == ERROR_SUCCESS)
-    {
-        DWORD size   = sizeof(DWORD);
-        DWORD dvalue = value;
-        RegSetValueEx(hkey, name, 0, REG_DWORD, (PBYTE)&dvalue, size);
-        RegCloseKey(hkey);
-    }
-}
-
-void ShaderWindow::DeleteRegistry(const wchar_t* name)
-{
-    HKEY  hkey;
-    DWORD dwDisposition;
-    if(RegCreateKeyEx(HKEY_CURRENT_USER, TEXT("Software\\ShaderGlass"), 0, NULL, 0, KEY_WRITE, NULL, &hkey, &dwDisposition) == ERROR_SUCCESS)
-    {
-        RegDeleteValue(hkey, name);
-        RegCloseKey(hkey);
-    }
-}
-
-int ShaderWindow::GetRegistryInt(const wchar_t* name, int default)
-{
-    HKEY hKey;
-    if(RegOpenKeyEx(HKEY_CURRENT_USER, TEXT("Software\\ShaderGlass"), 0, KEY_QUERY_VALUE, &hKey) == ERROR_SUCCESS)
-    {
-        DWORD dvalue = default;
-        DWORD size   = sizeof(DWORD);
-        RegGetValue(hKey, NULL, name, RRF_RT_REG_DWORD, NULL, &dvalue, &size);
-        RegCloseKey(hKey);
-        return (int)dvalue;
-    }
-
-    return default;
-}
-
-void ShaderWindow::SaveHotkeyState(bool state)
-{
-    SaveRegistryOption(TEXT("Global Hotkeys"), state);
-    UpdateHotkeys(state);
-}
-
-bool ShaderWindow::GetHotkeyState()
-{
-    return GetRegistryOption(TEXT("Global Hotkeys"), true);
-}
-
-void ShaderWindow::SaveFlipModeState(bool state)
-{
-    SaveRegistryOption(TEXT("Use Flip Mode"), state);
-}
-
-bool ShaderWindow::GetFlipModeState()
-{
-    return GetRegistryOption(TEXT("Use Flip Mode"), false);
-}
-
-void ShaderWindow::SaveTearingState(bool state)
-{
-    SaveRegistryOption(TEXT("Allow Tearing"), state);
-}
-
-bool ShaderWindow::GetTearingState()
-{
-    return GetRegistryOption(TEXT("Allow Tearing"), false);
-}
-
-void ShaderWindow::SaveMaxCaptureRateState(bool state)
-{
-    SaveRegistryOption(TEXT("Max Capture Rate"), state);
-}
-
-bool ShaderWindow::GetMaxCaptureRateState()
-{
-    return GetRegistryOption(TEXT("Max Capture Rate"), false);
-}
-
-void ShaderWindow::SaveUseHDRState(bool state)
-{
-    SaveRegistryOption(TEXT("Use HDR"), state);
-}
-
-bool ShaderWindow::GetUseHDRState()
-{
-    return GetRegistryOption(TEXT("Use HDR"), false);
-}
-
-void ShaderWindow::SaveRememberFPS(int fps)
-{
-    SaveRegistryInt(TEXT("Remember FPS"), fps);
-}
-
-bool ShaderWindow::RememberFPS()
-{
-    return GetRememberFPS() >= 0;
-}
-
-int ShaderWindow::GetRememberFPS()
-{
-    return GetRegistryInt(TEXT("Remember FPS"), -1);
-}
-
-void ShaderWindow::LoadRecentProfiles()
-{
-    m_recentProfiles.clear();
-
-    HKEY hKey;
-    if(RegOpenKeyEx(HKEY_CURRENT_USER, TEXT("Software\\ShaderGlass\\Recent"), 0, KEY_QUERY_VALUE, &hKey) == ERROR_SUCCESS)
-    {
-        for(int p = 0; p < MAX_RECENT_PROFILES; p++)
-        {
-            auto value = std::to_wstring(p);
-
-            wchar_t path[MAX_PATH + 1];
-            DWORD   size = MAX_PATH * sizeof(wchar_t);
-            if(RegGetValue(hKey, NULL, value.data(), RRF_RT_REG_SZ, NULL, path, &size) == ERROR_SUCCESS)
-            {
-                if(lstrlen(path) > 0)
-                    m_recentProfiles.push_back(path);
-            }
-        }
-        RegCloseKey(hKey);
-    }
-
-    // update menu
-    for(UINT i = 0; i < MAX_RECENT_PROFILES; i++)
-    {
-        RemoveMenu(m_recentMenu, WM_RECENT_PROFILE(i), MF_BYCOMMAND);
-    }
-    for(int p = 0; p < m_recentProfiles.size(); p++)
-    {
-        const auto& profile = m_recentProfiles.at(p);
-        InsertMenu(m_recentMenu, p, MF_STRING, WM_RECENT_PROFILE(p), profile.data());
-    }
-}
-
-void ShaderWindow::SaveRecentProfiles()
-{
-    HKEY  hkey;
-    DWORD dwDisposition;
-    if(RegCreateKeyEx(HKEY_CURRENT_USER, TEXT("Software\\ShaderGlass\\Recent"), 0, NULL, 0, KEY_WRITE | KEY_SET_VALUE, NULL, &hkey, &dwDisposition) == ERROR_SUCCESS)
-    {
-        for(int p = 0; p < MAX_RECENT_PROFILES; p++)
-        {
-            auto value = std::to_wstring(p);
-            if(p < m_recentProfiles.size())
-            {
-                // update value
-                const auto& path = m_recentProfiles.at(p);
-                RegSetValueEx(hkey, value.data(), 0, REG_SZ, (PBYTE)path.data(), (int)path.size() * sizeof(wchar_t));
-            }
-            else
-            {
-                // blank
-                RegSetValueEx(hkey, value.data(), 0, REG_SZ, (PBYTE)TEXT(""), sizeof(wchar_t));
-            }
-        }
-        RegCloseKey(hkey);
-    }
-
-    LoadRecentProfiles(); // rebuild menu
-}
-
-void ShaderWindow::AddRecentProfile(const std::wstring& path)
-{
-    if(path.find(L":") == std::wstring::npos || path == GetDefaultPath()) // don't store relative paths
-        return;
-
-    auto existingPos = std::find(m_recentProfiles.begin(), m_recentProfiles.end(), path);
-    if(existingPos != m_recentProfiles.end())
-    {
-        // already first one
-        if(*m_recentProfiles.begin() == path)
-            return;
-
-        // remove from the middle
-        m_recentProfiles.erase(existingPos);
-    }
-    // add to front
-    m_recentProfiles.insert(m_recentProfiles.begin(), path);
-    if(m_recentProfiles.size() > MAX_RECENT_PROFILES)
-    {
-        m_recentProfiles.resize(MAX_RECENT_PROFILES);
-    }
-    SaveRecentProfiles();
-}
-
-void ShaderWindow::RemoveRecentProfile(const std::wstring& path)
-{
-    auto existingPos = std::find(m_recentProfiles.begin(), m_recentProfiles.end(), path);
-    if(existingPos != m_recentProfiles.end())
-    {
-        m_recentProfiles.erase(existingPos);
-        SaveRecentProfiles();
-    }
-}
-
-void ShaderWindow::LoadRecentImports()
-{
-    m_recentImports.clear();
-
-    HKEY hKey;
-    if(RegOpenKeyEx(HKEY_CURRENT_USER, TEXT("Software\\ShaderGlass\\Imports"), 0, KEY_QUERY_VALUE, &hKey) == ERROR_SUCCESS)
-    {
-        for(int p = 0; p < MAX_RECENT_IMPORTS; p++)
-        {
-            auto value = std::to_wstring(p);
-
-            wchar_t path[MAX_PATH + 1];
-            DWORD   size = MAX_PATH * sizeof(wchar_t);
-            if(RegGetValue(hKey, NULL, value.data(), RRF_RT_REG_SZ, NULL, path, &size) == ERROR_SUCCESS)
-            {
-                if(lstrlen(path) > 0)
-                    m_recentImports.push_back(path);
-            }
-        }
-        RegCloseKey(hKey);
-    }
-
-    // update menu
-    for(UINT i = 0; i < MAX_RECENT_IMPORTS; i++)
-    {
-        RemoveMenu(m_importsMenu, WM_RECENT_IMPORT(i), MF_BYCOMMAND);
-    }
-    for(int p = 0; p < m_recentImports.size(); p++)
-    {
-        const auto& import = m_recentImports.at(p);
-        InsertMenu(m_importsMenu, p, MF_STRING, WM_RECENT_IMPORT(p), import.data());
-    }
-}
-
-void ShaderWindow::SaveRecentImports()
-{
-    HKEY  hkey;
-    DWORD dwDisposition;
-    if(RegCreateKeyEx(HKEY_CURRENT_USER, TEXT("Software\\ShaderGlass\\Imports"), 0, NULL, 0, KEY_WRITE | KEY_SET_VALUE, NULL, &hkey, &dwDisposition) == ERROR_SUCCESS)
-    {
-        for(int p = 0; p < MAX_RECENT_IMPORTS; p++)
-        {
-            auto value = std::to_wstring(p);
-            if(p < m_recentImports.size())
-            {
-                // update value
-                const auto& path = m_recentImports.at(p);
-                RegSetValueEx(hkey, value.data(), 0, REG_SZ, (PBYTE)path.data(), (int)path.size() * sizeof(wchar_t));
-            }
-            else
-            {
-                // blank
-                RegSetValueEx(hkey, value.data(), 0, REG_SZ, (PBYTE)TEXT(""), sizeof(wchar_t));
-            }
-        }
-        RegCloseKey(hkey);
-    }
-
-    LoadRecentImports(); // rebuild menu
-}
-
-void ShaderWindow::AddRecentImport(const std::wstring& path)
-{
-    if(path.find(L":") == std::wstring::npos) // don't store relative paths
-        return;
-
-    auto existingPos = std::find(m_recentImports.begin(), m_recentImports.end(), path);
-    if(existingPos != m_recentImports.end())
-    {
-        // already first one
-        if(*m_recentImports.begin() == path)
-            return;
-
-        // remove from the middle
-        m_recentImports.erase(existingPos);
-    }
-    // add to front
-    m_recentImports.insert(m_recentImports.begin(), path);
-    if(m_recentImports.size() > MAX_RECENT_IMPORTS)
-    {
-        m_recentImports.resize(MAX_RECENT_IMPORTS);
-    }
-    SaveRecentImports();
-}
-
-void ShaderWindow::RemoveRecentImport(const std::wstring& path)
-{
-    auto existingPos = std::find(m_recentImports.begin(), m_recentImports.end(), path);
-    if(existingPos != m_recentImports.end())
-    {
-        m_recentImports.erase(existingPos);
-        SaveRecentImports();
-    }
-}
-
-void ShaderWindow::UpdateGPUName()
-{
-    ModifyMenu(m_gpuMenu, ID_GPU_DEFAULT, MF_BYCOMMAND | MF_STRING | MF_CHECKED | MF_DISABLED | MF_GRAYED, ID_GPU_DEFAULT, m_captureManager.m_deviceName.c_str());
-}
-
-std::wstring ShaderWindow::GetDefaultPath() const
-{
-    wchar_t* path;
-    if(SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, NULL, &path)))
-    {
-        return std::wstring(path) + L"\\ShaderGlassDefault.sgp";
-    }
-    return L"ShaderGlassDefault.sgp";
-}
-
-void ShaderWindow::SaveDefault()
-{
-    SaveProfile(GetDefaultPath());
-}
-
-void ShaderWindow::RemoveDefault()
-{
-    try
-    {
-        const auto& path = GetDefaultPath();
-        if(std::filesystem::exists(path))
-        {
-            std::filesystem::remove(path);
-        }
-    }
-    catch(...)
-    { }
-}
-
-bool ShaderWindow::LoadDefault()
-{
-    try
-    {
-        const auto& path = GetDefaultPath();
-        if(std::filesystem::exists(path))
-        {
-            return LoadProfile(path);
-        }
-    }
-    catch(...)
-    { }
     return false;
 }
 
-bool ShaderWindow::ScaleLocked() const
+void ShaderGlass::DestroyShaders()
 {
-    return GetMenuState(m_outputScaleMenu, IDM_OUTPUT_LOCKSCALE, MF_BYCOMMAND) & MF_CHECKED;
+    m_shaderPasses.clear();
 }
 
-void ShaderWindow::SaveHotkey(const HotkeyInfo& hk)
+void ShaderGlass::DestroyPasses()
 {
-    if(hk.currentKey == hk.defaultKey)
+    for(auto& rs : m_passResources)
     {
-        DeleteRegistry(hk.name);
+        if(rs.first.starts_with("PassOutput") || rs.first.starts_with("PassFeedback"))
+        {
+            rs.second = nullptr;
+        }
+    }
+    m_passTargets.clear();
+    m_passTextures.clear();
+    m_passResources.clear();
+    m_requiresFeedback = false;
+    m_requiresHistory  = 0;
+}
+
+void ShaderGlass::PresentFrame()
+{
+    UINT presentFlags = 0;
+    if(m_flipMode)
+    {
+        DXGI_PRESENT_PARAMETERS presentParameters {};
+        presentFlags |= DXGI_PRESENT_RESTART;
+        if(m_allowTearing)
+        {
+            presentFlags |= DXGI_PRESENT_ALLOW_TEARING;
+        }
+        m_swapChain->Present1(0, presentFlags, &presentParameters);
     }
     else
     {
-        SaveRegistryInt(hk.name, hk.currentKey);
+        m_swapChain->Present(0, presentFlags);
     }
+    PostMessage(m_outputWindow, WM_PAINT, 0, 0); // necessary for click-through
 }
 
-void ShaderWindow::UpdateHotkey(const HotkeyInfo& hk, bool globalState)
+void ShaderGlass::Process(winrt::com_ptr<ID3D11Texture2D> texture, ULONGLONG frameTicks, int inputFrameNo)
 {
-    wchar_t     text[60];
-    const auto& keyString = hk.currentKey && globalState ? m_hotkeyDialog->GetKeyString(hk.currentKey) : std::wstring(hk.accelerator);
+    auto nowTicks            = GetTickCount64();
+    auto timeSinceLastRender = nowTicks - m_prevRenderTicks;
+    auto logicalFrameNo      = (int)roundf((nowTicks - m_startTicks) / 16.6666666f); // fix shaders at 60 fps
 
-    int checked;
-    switch(hk.id)
+    // same input
+    if(inputFrameNo == m_prevInputFrameNo)
     {
-    case ID_GLOBALHOTKEYS_CURSOR:
-        if(HasCaptureAPI())
+        if(logicalFrameNo == m_prevLogicalFrameNo)
+            return;
+
+        auto timeSinceLastInput = nowTicks - frameTicks;
+        if(timeSinceLastInput < 20) // 3.3 ms delay allowance for frame timing
+            return;
+    }
+
+    if(m_frameSkip > 0)
+    {
+        if(logicalFrameNo == m_prevLogicalFrameNo) // already rendered
+            return;
+
+        if((logicalFrameNo % (m_frameSkip + 1) != 0)) // don't need this frame
+            return;
+    }
+
+    m_frameCounter++;
+    m_prevFrameTicks     = frameTicks;
+    m_prevInputFrameNo   = inputFrameNo;
+    m_prevLogicalFrameNo = logicalFrameNo;
+
+    if(!m_running || !texture)
+    {
+        // skip frame
+        PresentFrame();
+        return;
+    }
+
+    std::unique_lock lock(m_mutex, std::try_to_lock);
+    if(!lock.owns_lock())
+    {
+        // still rendering, drop frame
+        return;
+    }
+
+    POINT topLeft;
+    topLeft.x = 0;
+    topLeft.y = 0;
+    ClientToScreen(m_outputWindow, &topLeft);
+
+    if(!m_captureWindow && !m_clone)
+    {
+        // desktop glass
+        topLeft.x -= m_monitorOffset.x;
+        topLeft.y -= m_monitorOffset.y;
+    }
+
+    RECT clientRect;
+    GetClientRect(m_outputWindow, &clientRect);
+
+    RECT outputRect;
+    GetWindowRect(m_outputWindow, &outputRect);
+
+    D3D11_TEXTURE2D_DESC capturedTextureDesc = {};
+    texture->GetDesc(&capturedTextureDesc);
+
+    auto inputResized    = (m_captureWindow || m_image) && m_croppedAreaUpdated;
+    m_croppedAreaUpdated = false;
+
+    // properties of the window being captured
+    RECT  captureRect;
+    POINT captureTopLeft;
+    RECT  captureClient;
+    captureTopLeft.x = 0;
+    captureTopLeft.y = 0;
+    bool outputMoved = false;
+    if(m_captureWindow)
+    {
+        if(m_captureWindow != HWND_BROADCAST)
         {
-            checked = m_captureOptions.captureCursor ? MF_CHECKED : MF_UNCHECKED;
-            _snwprintf_s(text, 60, L"Capture Cursor\t%s", keyString.c_str());
-            ModifyMenu(m_inputMenu, IDM_INPUT_CAPTURECURSOR, MF_BYCOMMAND | MF_STRING | checked, IDM_INPUT_CAPTURECURSOR, text);
+            ClientToScreen(m_captureWindow, &captureTopLeft);
+            GetClientRect(m_captureWindow, &captureClient);
+
+            DwmGetWindowAttribute(m_captureWindow, DWMWA_EXTENDED_FRAME_BOUNDS, &captureRect, sizeof(RECT));
         }
-        break;
-    case ID_GLOBALHOTKEYS_FULLSCREEN:
-        _snwprintf_s(text, 60, L"Fullscreen\t%s", keyString.c_str());
-        ModifyMenu(m_outputMenu, ID_PROCESSING_FULLSCREEN, MF_BYCOMMAND | MF_STRING, ID_PROCESSING_FULLSCREEN, text);
-        break;
-    case ID_GLOBALHOTKEYS_PAUSE:
-        _snwprintf_s(text, 60, L"Pause/Unpause\t%s", keyString.c_str());
-        ModifyMenu(m_programMenu, ID_PROCESSING_PAUSE, MF_BYCOMMAND | MF_STRING, ID_PROCESSING_PAUSE, text);
-        break;
-    case ID_GLOBALHOTKEYS_SCREENSHOT:
-        _snwprintf_s(text, 60, L"Take Snapshot...\t%s", keyString.c_str());
-        ModifyMenu(m_outputMenu, ID_PROCESSING_SCREENSHOT, MF_BYCOMMAND | MF_STRING, ID_PROCESSING_SCREENSHOT, text);
-        break;
-    case ID_GLOBALHOTKEYS_ACTIVE:
-        _snwprintf_s(text, 60, L"Active\t%s | TAB", keyString.c_str());
-        ModifyMenu(m_shaderMenu, ID_QUICK_TOGGLE, MF_BYCOMMAND | MF_STRING, ID_QUICK_TOGGLE, text);
-        break;
-    case ID_GLOBALHOTKEYS_SHOWMENU:
-        _snwprintf_s(text, 60, L"Toggle Menu\t%s", keyString.c_str());
-        ModifyMenu(m_programMenu, IDM_TOGGLEMENU, MF_BYCOMMAND | MF_STRING, IDM_TOGGLEMENU, text);
-        break;
-    }
-}
-
-void ShaderWindow::LoadHotkeys()
-{
-    m_hotkeys.emplace(ID_GLOBALHOTKEYS_FULLSCREEN, HotkeyInfo(ID_GLOBALHOTKEYS_FULLSCREEN, MAKEWORD('G', MOD_CONTROL | MOD_SHIFT), L"Fullscreen Key", L"g"));
-    m_hotkeys.emplace(ID_GLOBALHOTKEYS_SCREENSHOT, HotkeyInfo(ID_GLOBALHOTKEYS_SCREENSHOT, MAKEWORD('S', MOD_CONTROL | MOD_SHIFT), L"Screenshot Key", L"s"));
-    m_hotkeys.emplace(ID_GLOBALHOTKEYS_PAUSE, HotkeyInfo(ID_GLOBALHOTKEYS_PAUSE, 0, L"Pause Key", L"t"));
-    m_hotkeys.emplace(ID_GLOBALHOTKEYS_CURSOR, HotkeyInfo(ID_GLOBALHOTKEYS_CURSOR, 0, L"Cursor Key", L"c"));
-    m_hotkeys.emplace(ID_GLOBALHOTKEYS_ACTIVE, HotkeyInfo(ID_GLOBALHOTKEYS_ACTIVE, 0, L"Active Key", L"a"));
-    m_hotkeys.emplace(ID_GLOBALHOTKEYS_SHOWMENU, HotkeyInfo(ID_GLOBALHOTKEYS_SHOWMENU, 0, L"Menu Key", L"m"));
-}
-
-void ShaderWindow::UpdateHotkeys(bool globalHotkeys)
-{
-    for(auto& hk : m_hotkeys)
-    {
-        hk.second.currentKey = GetRegistryInt(hk.second.name, hk.second.defaultKey);
-        UpdateHotkey(hk.second, globalHotkeys);
-    }
-}
-
-void ShaderWindow::RegisterHotkeys()
-{
-    for(const auto& hk : m_hotkeys)
-    {
-        if(hk.second.currentKey)
-            RegisterHotKey(m_mainWindow, hk.first, HIBYTE(hk.second.currentKey), LOBYTE(hk.second.currentKey));
-    }
-}
-
-void ShaderWindow::UnregisterHotkeys()
-{
-    for(const auto& hk : m_hotkeys)
-    {
-        UnregisterHotKey(m_mainWindow, hk.first);
-    }
-}
-
-void ShaderWindow::Start(_In_ LPWSTR lpCmdLine, HWND paramsWindow, HWND browserWindow, HWND compileWindow)
-{
-    bool autoStart  = true;
-    bool fullScreen = false;
-
-    if(lpCmdLine)
-    {
-        int  numArgs;
-        auto cmdLine = GetCommandLineW();
-        auto args    = CommandLineToArgvW(cmdLine, &numArgs);
-
-        for(int a = 1; a < numArgs; a++)
+        else
         {
-            if(wcscmp(args[a], L"-paused") == 0 || wcscmp(args[a], L"-p") == 0)
-                autoStart = false;
-            else if(wcscmp(args[a], L"-fullscreen") == 0 || wcscmp(args[a], L"-f") == 0)
-                fullScreen = true;
-            else if(wcscmp(args[a], L"-safe") == 0 || wcscmp(args[a], L"-s") == 0)
-                CaptureLib::Disable();
-            else if(wcscmp(args[a], L"-reset") == 0 || wcscmp(args[a], L"-r") == 0)
-                ForgetStartingPosition();
-            else if(a == numArgs - 1)
+            captureRect.left   = 0;
+            captureRect.right  = capturedTextureDesc.Width;
+            captureRect.top    = 0;
+            captureRect.bottom = capturedTextureDesc.Height;
+            captureClient      = captureRect;
+        }
+        captureTopLeft.x += m_croppedArea.left;
+        captureTopLeft.y += m_croppedArea.top;
+        captureClient.right -= (m_croppedArea.left + m_croppedArea.right);
+        captureClient.bottom -= (m_croppedArea.top + m_croppedArea.bottom);
+        if(captureClient.right <= 0)
+            captureClient.right = 1;
+        if(captureClient.bottom <= 0)
+            captureClient.bottom = 1;
+
+        outputMoved = (m_lastCaptureWindowPos.x != captureRect.left || m_lastCaptureWindowPos.y != captureRect.bottom);
+        if(outputMoved)
+        {
+            m_lastCaptureWindowPos.x = captureRect.left;
+            m_lastCaptureWindowPos.y = captureRect.bottom;
+        }
+
+        inputResized |= m_lastCaptureWindowSize.x != capturedTextureDesc.Width || m_lastCaptureWindowSize.y != capturedTextureDesc.Height;
+        if(inputResized)
+        {
+            m_lastCaptureWindowSize.x = capturedTextureDesc.Width;
+            m_lastCaptureWindowSize.y = capturedTextureDesc.Height;
+        }
+    }
+    else if(m_image)
+    {
+        captureTopLeft.x += m_croppedArea.left;
+        captureTopLeft.y += m_croppedArea.top;
+        captureRect.left   = 0;
+        captureRect.top    = 0;
+        captureRect.right  = capturedTextureDesc.Width;
+        captureRect.bottom = capturedTextureDesc.Height;
+        captureClient      = captureRect;
+        captureClient.right -= (m_croppedArea.left + m_croppedArea.right);
+        captureClient.bottom -= (m_croppedArea.top + m_croppedArea.bottom);
+    }
+
+    RECT textureRect;
+    textureRect.right  = capturedTextureDesc.Width;
+    textureRect.bottom = capturedTextureDesc.Height;
+
+    auto outputResized = false;
+    outputResized      = TryResizeSwapChain(clientRect, m_outputRescaled);
+
+    if(clientRect.right <= 0 || clientRect.bottom <= 0)
+    {
+        // skip
+        PresentFrame();
+        return;
+    }
+
+    auto clientWidth  = clientRect.right;
+    auto clientHeight = clientRect.bottom;
+
+    float boxX = 0, boxY = 0;
+    if(m_captureWindow || m_image)
+    {
+        const auto captureW = (captureClient.right - captureClient.left);
+        const auto captureH = (captureClient.bottom - captureClient.top);
+
+        if(!m_freeScale)
+        {
+            clientWidth  = (LONG)roundf(captureW / m_outputScaleW);
+            clientHeight = (LONG)roundf(captureH / m_outputScaleH);
+        }
+
+        // box if needed
+        if(captureW != 0 && captureH != 0)
+        {
+            auto inputAspectRatio  = captureW / (float)captureH;
+            auto outputAspectRatio = (clientWidth * m_outputScaleW) / (clientHeight * m_outputScaleH);
+            if(outputAspectRatio > inputAspectRatio)
             {
-                std::wstring ws(args[a]);
-                if(ws.size())
-                    LoadProfile(ws, autoStart);
+                // output is wider
+                auto newWidth = (LONG)roundf(clientHeight * (m_outputScaleH / m_outputScaleW) * inputAspectRatio);
+                boxX          = (clientWidth - newWidth) / 2.0f;
+                clientWidth   = newWidth;
+            }
+            else if(outputAspectRatio < inputAspectRatio)
+            {
+                // output is narrower
+                auto newHeight = (LONG)roundf(clientWidth * (m_outputScaleW / m_outputScaleH) / inputAspectRatio);
+                boxY           = (clientHeight - newHeight) / 2.0f;
+                clientHeight   = newHeight;
+            }
+
+            // center (fullscreen?)
+            if(!m_freeScale)
+            {
+                boxX += (clientRect.right - (captureW / m_outputScaleW)) / 2.0f;
+                boxY += (clientRect.bottom - (captureH / m_outputScaleH)) / 2.0f;
+            }
+
+            if(boxX < 0)
+                boxX = 0;
+            if(boxY < 0)
+                boxY = 0;
+        }
+    }
+    m_boxX = static_cast<int>(boxX);
+    m_boxY = static_cast<int>(boxY);
+
+    // final window/viewport size
+    UINT viewportWidth  = static_cast<UINT>(clientWidth);
+    UINT viewportHeight = static_cast<UINT>(clientHeight);
+
+    auto destWidth  = static_cast<long>(clientWidth * m_outputScaleW);
+    auto destHeight = static_cast<long>(clientHeight * m_outputScaleH);
+
+    if(destWidth <= (int)m_inputScaleW || destHeight <= (int)m_inputScaleH)
+        return;
+
+    bool inputRescaled = m_inputRescaled;
+    m_inputRescaled    = false;
+    m_outputRescaled   = false;
+
+    // force recreate
+    if(inputRescaled || inputResized || m_verticalUpdated)
+    {
+        if(m_preprocessedRenderTarget != nullptr)
+        {
+            DestroyTargets();
+            if(m_displayRenderTarget)
+            {
+                m_context->ClearRenderTargetView(m_displayRenderTarget.get(), background_colour);
+            }
+        }
+        else
+        {
+            // clear any blanks around captured window
+            m_context->ClearRenderTargetView(m_displayRenderTarget.get(), background_colour);
+        }
+    }
+
+    bool rebuildPasses = false;
+
+    if(m_newShaderPreset || m_verticalUpdated)
+    {
+        m_startTicks = GetTickCount64(); // reset logical frame no
+
+        DestroyShaders();
+        if(m_newShaderPreset)
+        {
+            m_shaderPreset.swap(m_newShaderPreset);
+            m_newShaderPreset.reset();
+        }
+        RebuildShaders();
+        if(m_newParams.size())
+        {
+            const auto& shaderParams = Params();
+            for(const auto& ip : m_newParams)
+            {
+                for(const auto& sp : shaderParams)
+                {
+                    if(get<0>(ip) == get<0>(sp) && get<1>(ip) == get<1>(sp)->name)
+                    {
+                        get<1>(sp)->currentValue = (float)get<2>(ip);
+                        break;
+                    }
+                }
+            }
+            m_newParams.clear();
+            UpdateParams();
+        }
+        PostMessage(m_outputWindow, WM_COMMAND, IDM_UPDATE_PARAMS, 0);
+        inputRescaled     = true;
+        outputResized     = true;
+        rebuildPasses     = true;
+        m_verticalUpdated = false;
+    }
+
+    // size of preprocessed input, which is 'original' for the shader chain
+    UINT originalWidth  = static_cast<UINT>(destWidth / m_inputScaleW);
+    UINT originalHeight = static_cast<UINT>(destHeight / m_inputScaleH);
+
+    if(m_captureWindow || m_image)
+    {
+        const auto captureW = captureClient.right;
+        const auto captureH = captureClient.bottom;
+        originalWidth       = static_cast<UINT>(captureW / m_inputScaleW);
+        originalHeight      = static_cast<UINT>(captureH / m_inputScaleH);
+    }
+
+    // create preprocessed output texture, scaled down size, inverted etc.
+    if(m_preprocessedTexture == nullptr)
+    {
+        D3D11_TEXTURE2D_DESC desc2 = {};
+        texture->GetDesc(&desc2);
+        desc2.Usage          = D3D11_USAGE_DEFAULT;
+        desc2.BindFlags      = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+        desc2.CPUAccessFlags = 0;
+        desc2.MiscFlags      = 0;
+        desc2.Width          = m_vertical ? originalHeight : originalWidth;
+        desc2.Height         = m_vertical ? originalWidth : originalHeight;
+
+        hr = m_device->CreateTexture2D(&desc2, nullptr, m_preprocessedTexture.put());
+        assert(SUCCEEDED(hr));
+        outputResized = true;
+        rebuildPasses = true;
+
+        hr = m_device->CreateShaderResourceView(m_preprocessedTexture.get(), nullptr, m_originalView.put());
+        assert(SUCCEEDED(hr));
+    }
+
+    // create texture render target
+    if(m_preprocessedRenderTarget == nullptr)
+    {
+        hr = m_device->CreateRenderTargetView(m_preprocessedTexture.get(), NULL, m_preprocessedRenderTarget.put());
+        assert(SUCCEEDED(hr));
+        rebuildPasses = true;
+    }
+
+    if(inputRescaled || outputResized || inputResized)
+    {
+        if(m_vertical)
+        {
+            std::swap(originalWidth, originalHeight);
+            std::swap(viewportWidth, viewportHeight);
+        }
+
+        m_textureSizes.clear();
+        m_textureSizes.insert(std::make_pair("Original", float4 {(float)originalWidth, (float)originalHeight, 1.0f / originalWidth, 1.0f / originalHeight}));
+        m_textureSizes.insert(std::make_pair("FinalViewport", float4 {(float)viewportWidth, (float)viewportHeight, 1.0f / viewportWidth, 1.0f / viewportHeight}));
+
+        // preprocess takes original texture full size
+        std::vector<std::array<UINT, 4>> passSizes;
+        m_preprocessPass.Resize(capturedTextureDesc.Width, capturedTextureDesc.Height, originalWidth, originalHeight, m_textureSizes, passSizes);
+
+        UINT sourceWidth  = originalWidth;
+        UINT sourceHeight = originalHeight;
+        for(int p = 0; p < m_shaderPasses.size(); p++)
+        {
+            auto& shaderPass = m_shaderPasses[p];
+            if(p == m_shaderPasses.size() - 1) // last shader scales source to viewport
+            {
+                if(m_vertical)
+                {
+                    std::swap(originalWidth, originalHeight);
+                    std::swap(viewportWidth, viewportHeight);
+                }
+                passSizes.push_back({sourceWidth, sourceHeight, viewportWidth, viewportHeight});
+            }
+            else
+            {
+                UINT outputWidth  = sourceWidth;
+                UINT outputHeight = sourceHeight;
+                if(shaderPass.m_shader.m_scaleViewportX)
+                    outputWidth = static_cast<UINT>(viewportWidth * shaderPass.m_shader.m_scaleX);
+                else if(shaderPass.m_shader.m_scaleAbsoluteX)
+                    outputWidth = static_cast<UINT>(shaderPass.m_shader.m_scaleX);
+                else
+                    outputWidth = static_cast<UINT>(sourceWidth * shaderPass.m_shader.m_scaleX);
+                if(shaderPass.m_shader.m_scaleViewportY)
+                    outputHeight = static_cast<UINT>(viewportHeight * shaderPass.m_shader.m_scaleY);
+                else if(shaderPass.m_shader.m_scaleAbsoluteY)
+                    outputHeight = static_cast<UINT>(shaderPass.m_shader.m_scaleY);
+                else
+                    outputHeight = static_cast<UINT>(sourceHeight * shaderPass.m_shader.m_scaleY);
+                passSizes.push_back({sourceWidth, sourceHeight, outputWidth, outputHeight});
+                if(!shaderPass.m_shader.m_alias.empty())
+                {
+                    m_textureSizes.insert(std::make_pair(shaderPass.m_shader.m_alias, float4 {(float)outputWidth, (float)outputHeight, 1.0f / outputWidth, 1.0f / outputHeight}));
+                    m_textureSizes.insert(std::make_pair(shaderPass.m_shader.m_alias + "Feedback", float4 {(float)outputWidth, (float)outputHeight, 1.0f / outputWidth, 1.0f / outputHeight}));
+                }
+                sourceWidth  = outputWidth;
+                sourceHeight = outputHeight;
+            }
+        }
+
+        // call resize once all textureSizes are determined
+        for(int p = 0; p < m_shaderPasses.size(); p++)
+        {
+            auto& shaderPass = m_shaderPasses[p];
+            shaderPass.Resize(passSizes[p][0], passSizes[p][1], passSizes[p][2], passSizes[p][3], m_textureSizes, passSizes);
+        }
+    }
+
+    if(rebuildPasses)
+    {
+        DestroyPasses();
+
+        for(auto& pt : m_presetTextures)
+        {
+            // re-add static preset textures
+            m_passResources.insert(pt);
+        }
+
+        m_passResources.insert(std::make_pair("Original", m_originalView));
+
+        m_preprocessPass.m_targetView = m_preprocessedRenderTarget.get();
+        if(m_shaderPasses.size() > 1)
+        {
+            D3D11_TEXTURE2D_DESC desc2 = {};
+            texture->GetDesc(&desc2);
+            desc2.Usage          = D3D11_USAGE_DEFAULT;
+            desc2.BindFlags      = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+            desc2.CPUAccessFlags = 0;
+            desc2.MiscFlags      = 0;
+
+            for(const auto& pass : m_shaderPasses)
+            {
+                m_requiresFeedback |= pass.RequiresFeedback();
+                m_requiresHistory = max(m_requiresHistory, pass.RequiresHistory());
+            }
+
+            for(size_t p = 1; p < m_shaderPasses.size(); p++)
+            {
+                const auto& pass = m_shaderPasses[p - 1];
+
+                desc2.Format = pass.m_shader.m_format;
+
+                // use shader output size
+                desc2.Width     = pass.m_destWidth;
+                desc2.Height    = pass.m_destHeight;
+                desc2.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+
+                winrt::com_ptr<ID3D11Texture2D> passTexture;
+                hr = m_device->CreateTexture2D(&desc2, nullptr, passTexture.put());
+                assert(SUCCEEDED(hr));
+                m_passTextures.push_back(passTexture);
+
+                winrt::com_ptr<ID3D11RenderTargetView> passTarget;
+                hr = m_device->CreateRenderTargetView(passTexture.get(), nullptr, passTarget.put());
+                assert(SUCCEEDED(hr));
+                m_passTargets.push_back(passTarget);
+
+                winrt::com_ptr<ID3D11ShaderResourceView> passResource;
+                hr = m_device->CreateShaderResourceView(passTexture.get(), nullptr, passResource.put());
+                assert(SUCCEEDED(hr));
+                m_passResources.insert(std::make_pair(std::string("PassOutput") + std::to_string(p - 1), passResource));
+                if(!pass.m_shader.m_alias.empty())
+                {
+                    m_passResources.insert(std::make_pair(pass.m_shader.m_alias, passResource));
+                }
+
+                // create feedback textures if needed
+                if(m_requiresFeedback)
+                {
+                    desc2.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+                    winrt::com_ptr<ID3D11Texture2D> feedbackTexture;
+                    hr = m_device->CreateTexture2D(&desc2, nullptr, feedbackTexture.put());
+                    assert(SUCCEEDED(hr));
+                    m_passTextures.push_back(feedbackTexture);
+                    winrt::com_ptr<ID3D11ShaderResourceView> feedbackResource;
+                    hr = m_device->CreateShaderResourceView(feedbackTexture.get(), nullptr, feedbackResource.put());
+                    assert(SUCCEEDED(hr));
+                    m_passResources.insert(std::make_pair(std::string("PassFeedback") + std::to_string(p - 1), feedbackResource));
+                    if(!pass.m_shader.m_alias.empty())
+                    {
+                        m_passResources.insert(std::make_pair(pass.m_shader.m_alias + "Feedback", feedbackResource));
+                    }
+                }
+
+                m_shaderPasses[p - 1].m_targetView = passTarget.get();
+                m_shaderPasses[p].m_sourceView     = passResource.get();
+            }
+        }
+        else
+        {
+            m_requiresHistory = m_shaderPasses.begin()->RequiresHistory();
+        }
+
+        if(m_requiresHistory)
+        {
+            D3D11_TEXTURE2D_DESC desc2 = {};
+            texture->GetDesc(&desc2);
+            desc2.Usage          = D3D11_USAGE_DEFAULT;
+            desc2.BindFlags      = D3D11_BIND_SHADER_RESOURCE;
+            desc2.CPUAccessFlags = 0;
+            desc2.MiscFlags      = 0;
+            desc2.Width          = m_vertical ? originalHeight : originalWidth;
+            desc2.Height         = m_vertical ? originalWidth : originalHeight;
+
+            for(int h = 0; h < m_requiresHistory; h++)
+            {
+                winrt::com_ptr<ID3D11Texture2D> historyTexture;
+                hr = m_device->CreateTexture2D(&desc2, nullptr, historyTexture.put());
+                assert(SUCCEEDED(hr));
+                m_passTextures.push_back(historyTexture);
+                winrt::com_ptr<ID3D11ShaderResourceView> historyResource;
+                hr = m_device->CreateShaderResourceView(historyTexture.get(), nullptr, historyResource.put());
+                assert(SUCCEEDED(hr));
+                m_passResources.insert(std::make_pair(std::string("OriginalHistory") + std::to_string(h + 1), historyResource));
+            }
+        }
+
+        m_shaderPasses[m_shaderPasses.size() - 1].m_targetView = m_displayRenderTarget.get();
+
+        if(m_requiresFeedback)
+        {
+            // add feedback for last pass
+            int         p        = (int)m_shaderPasses.size() - 1;
+            const auto& lastPass = m_shaderPasses[p];
+
+            D3D11_TEXTURE2D_DESC desc2 = {};
+            m_displayTexture->GetDesc(&desc2);
+            desc2.Usage          = D3D11_USAGE_DEFAULT;
+            desc2.BindFlags      = D3D11_BIND_SHADER_RESOURCE;
+            desc2.CPUAccessFlags = 0;
+            desc2.MiscFlags      = 0;
+            desc2.Width          = lastPass.m_destWidth;
+            desc2.Height         = lastPass.m_destHeight;
+
+            winrt::com_ptr<ID3D11Texture2D> feedbackTexture;
+            hr = m_device->CreateTexture2D(&desc2, nullptr, feedbackTexture.put());
+            assert(SUCCEEDED(hr));
+            m_passTextures.push_back(feedbackTexture);
+            winrt::com_ptr<ID3D11ShaderResourceView> feedbackResource;
+            hr = m_device->CreateShaderResourceView(feedbackTexture.get(), nullptr, feedbackResource.put());
+            assert(SUCCEEDED(hr));
+            m_passResources.insert(std::make_pair(std::string("PassFeedback") + std::to_string(p), feedbackResource));
+            if(!lastPass.m_shader.m_alias.empty())
+            {
+                m_passResources.insert(std::make_pair(lastPass.m_shader.m_alias + "Feedback", feedbackResource));
             }
         }
     }
 
-    m_paramsWindow  = paramsWindow;
-    m_browserWindow = browserWindow;
-    m_compileWindow = compileWindow;
-    m_inputDialog.reset(new InputDialog(m_instance, m_mainWindow));
-    m_cropDialog.reset(new CropDialog(m_instance, m_mainWindow));
-    m_hotkeyDialog.reset(new HotkeyDialog(m_instance, m_mainWindow));
-
-    if(autoStart && HasCaptureAPI() && !m_forceStart)
+    if(outputMoved || outputResized || inputResized || (m_lastPos.x != topLeft.x || m_lastPos.y != topLeft.y) || m_lockedAreaUpdated)
     {
-        SendMessage(m_mainWindow, WM_COMMAND, IDM_START, 0);
-        SendMessage(m_paramsWindow, WM_COMMAND, IDM_UPDATE_PARAMS, 0);
-    }
-    if(fullScreen)
-    {
-        SendMessage(m_mainWindow, WM_COMMAND, ID_PROCESSING_FULLSCREEN, 0);
+        // preprocess captured frame to a texture: crop (via scale & translation), reduce resolution, and whatnot (invert y?)
+        float sx = 1.0f, sy = 1.0f, tx = 0.0f, ty = 0.0f;
+        POINT finalTopLeft  = topLeft;
+        m_lockedAreaUpdated = false;
+        if(m_lockedArea.right - m_lockedArea.left != 0)
+        {
+            // we only lock position
+            finalTopLeft.x = m_lockedArea.left;
+            finalTopLeft.y = m_lockedArea.top;
+        }
+        if(!m_captureWindow && !m_image)
+        {
+            if(m_clone)
+            {
+                // desktop clone (take from 0,0)
+                auto clientW = destWidth;
+                auto clientH = destHeight;
+                sx           = 1.0f * capturedTextureDesc.Width / clientW;
+                sy           = 1.0f * capturedTextureDesc.Height / clientH;
+                tx           = 1.0f * capturedTextureDesc.Width / clientW - 1.0f;
+                ty           = -1.0f * capturedTextureDesc.Height / clientH + 1.0f;
+            }
+            else
+            {
+                // desktop glass
+                auto clientW = destWidth;
+                auto clientH = destHeight;
+                sx           = 1.0f * capturedTextureDesc.Width / clientW;
+                sy           = 1.0f * capturedTextureDesc.Height / clientH;
+                tx           = -(2.0f * finalTopLeft.x - capturedTextureDesc.Width) / clientW - 1.0f;
+                ty           = (2.0f * finalTopLeft.y - capturedTextureDesc.Height) / clientH + 1.0f;
+            }
+        }
+        else
+        {
+            if(m_clone)
+            {
+                auto clientW = destWidth;
+                auto clientH = destHeight;
+                if(m_freeScale)
+                {
+                    clientW = captureClient.right;
+                    clientH = captureClient.bottom;
+                }
+                sx = 1.0f * capturedTextureDesc.Width / clientW;
+                sy = 1.0f * capturedTextureDesc.Height / clientH;
+                tx = -(2.0f * (captureTopLeft.x - captureRect.left) - capturedTextureDesc.Width) / clientW - 1.0f;
+                ty = (2.0f * (captureTopLeft.y - captureRect.top) - capturedTextureDesc.Height) / clientH + 1.0f;
+            }
+            else
+            {
+                // window glass
+                auto clientW = destWidth;
+                auto clientH = destHeight;
+                sx           = 1.0f * capturedTextureDesc.Width / clientW;
+                sy           = 1.0f * capturedTextureDesc.Height / clientH;
+                tx           = -(2.0f * (finalTopLeft.x - captureRect.left) - capturedTextureDesc.Width) / clientW - 1.0f;
+                ty           = (2.0f * (finalTopLeft.y - captureRect.top) - capturedTextureDesc.Height) / clientH + 1.0f;
+            }
+        }
+        if(m_flipHorizontal)
+        {
+            sx *= -1.0f;
+            tx *= -1.0f;
+        }
+        if(m_flipVertical)
+        {
+            sy *= -1.0f;
+            ty *= -1.0f;
+        }
+
+        // offset to move away from edges; needed for SG to consistently pick up n-th input pixel if asked to, but I should find a formula to calculate this
+        tx += 0.0001f;
+        ty += 0.0001f;
+
+        m_preprocessPass.UpdateMVP(sx, sy, tx, ty);
+        m_lastPos.x = topLeft.x;
+        m_lastPos.y = topLeft.y;
     }
 
-    SetTimer(m_mainWindow, TIMER_TITLE, 1000, NULL);
+    if(m_captureWindow && !m_clone)
+    {
+        // clear any blanks around captured window
+        m_context->ClearRenderTargetView(m_preprocessedRenderTarget.get(), background_colour);
+    }
+
+    winrt::com_ptr<ID3D11ShaderResourceView> textureView;
+    hr = m_device->CreateShaderResourceView(texture.get(), nullptr, textureView.put());
+    assert(SUCCEEDED(hr));
+    m_preprocessPass.Render(textureView.get(), m_passResources, logicalFrameNo, 0, 0);
+
+    if(m_cursorEmulator.Hidden())
+    {
+        CURSORINFO ci {.cbSize = sizeof(CURSORINFO)};
+        if(GetCursorInfo(&ci))
+        {
+            auto mx = ci.ptScreenPos.x;
+            auto my = ci.ptScreenPos.y;
+            
+            if(!m_clone)
+            {
+                // glass
+                mx -= m_monitorOffset.x;
+                my -= m_monitorOffset.y;
+
+                mx -= topLeft.x;
+                my -= topLeft.y;
+            }
+            else if(m_captureWindow)
+            {
+                mx -= captureTopLeft.x;
+                my -= captureTopLeft.y;
+            }
+
+            auto cursor = m_cursorEmulator.GetCursor();
+            if(cursor && cursor->image)
+            {
+                mx -= cursor->hotSpotX;
+                my -= cursor->hotSpotY;
+
+                float cx, cy, cw, ch;
+
+                if(m_vertical)
+                {
+                    cx = m_preprocessPass.m_destWidth - (my + cursor->w) / m_inputScaleW;
+                    cy = m_preprocessPass.m_destHeight - (mx + cursor->h) / m_inputScaleH;
+                    cw = cursor->w / m_inputScaleW;
+                    ch = cursor->h / m_inputScaleH;
+                }
+                else
+                {
+                    cx = mx / m_inputScaleW;
+                    cy = my / m_inputScaleH;
+                    cw = cursor->w / m_inputScaleW;
+                    ch = cursor->h / m_inputScaleH;
+                }
+                m_preprocessPass.RenderCursor(cx, cy, cw, ch, cursor->view);
+            }
+        }
+    }
+
+    int p = 0;
+    for(auto& shaderPass : m_shaderPasses)
+    {
+        auto passBoxX = p == m_shaderPasses.size() - 1 ? m_boxX : 0;
+        auto passBoxY = p == m_shaderPasses.size() - 1 ? m_boxY : 0;
+
+        if(p == 0)
+        {
+            shaderPass.Render(m_originalView.get(), m_passResources, logicalFrameNo, passBoxX, passBoxY);
+        }
+        else
+        {
+            shaderPass.Render(m_passResources, logicalFrameNo, passBoxX, passBoxY);
+        }
+        p++;
+    }
+
+    if(m_requiresFeedback)
+    {
+        // copy output to feedback
+        for(size_t q = 0; q < m_shaderPasses.size() - 1; q++)
+        {
+            auto                           passOutput   = m_passResources.find(std::string("PassOutput") + std::to_string(q));
+            auto                           passFeedback = m_passResources.find(std::string("PassFeedback") + std::to_string(q));
+            winrt::com_ptr<ID3D11Resource> outputResource;
+            winrt::com_ptr<ID3D11Resource> feedbackResource;
+            passOutput->second->GetResource(outputResource.put());
+            passFeedback->second->GetResource(feedbackResource.put());
+            m_context->CopyResource(feedbackResource.get(), outputResource.get());
+        }
+
+        // copy display texture as last pass feedback
+        auto displayTexture = m_displayTexture;
+        if(displayTexture)
+        {
+            int                            p                = (int)m_shaderPasses.size() - 1;
+            const auto&                    lastPass         = m_shaderPasses[p];
+            auto                           lastPassFeedback = m_passResources.find(std::string("PassFeedback") + std::to_string(p));
+            winrt::com_ptr<ID3D11Resource> lastPassFeedbackResource;
+            lastPassFeedback->second->GetResource(lastPassFeedbackResource.put());
+            D3D11_TEXTURE2D_DESC desc3 = {};
+            displayTexture->GetDesc(&desc3);
+            if(m_boxX != 0 || m_boxY != 0 || lastPass.m_destWidth != desc3.Width || lastPass.m_destHeight != desc3.Height)
+            {
+                D3D11_BOX srcBox;
+                srcBox.left   = m_boxX;
+                srcBox.right  = srcBox.left + lastPass.m_destWidth;
+                srcBox.top    = m_boxY;
+                srcBox.bottom = srcBox.top + lastPass.m_destHeight;
+                srcBox.back   = 1;
+                srcBox.front  = 0;
+                m_context->CopySubresourceRegion(lastPassFeedbackResource.get(), 0, 0, 0, 0, displayTexture.get(), 0, &srcBox);
+            }
+            else
+            {
+                m_context->CopyResource(lastPassFeedbackResource.get(), displayTexture.get());
+            }
+        }
+    }
+
+    if(m_requiresHistory)
+    {
+        // lookup oldest History for reuse
+        const auto&                    lastHistory     = m_passResources.find(std::string("OriginalHistory" + std::to_string(m_requiresHistory)));
+        auto                           lastHistoryView = lastHistory->second;
+        winrt::com_ptr<ID3D11Resource> lastHistoryResource;
+        lastHistoryView->GetResource(lastHistoryResource.put());
+
+        for(int h = m_requiresHistory; h > 1; h--)
+        {
+            // remap middle Histories one frame back
+            m_passResources[std::string("OriginalHistory" + std::to_string(h))] = m_passResources[std::string("OriginalHistory" + std::to_string(h - 1))];
+        }
+
+        // copy current Original to History1 for next pass
+        const auto&                    original = m_passResources.find("Original");
+        winrt::com_ptr<ID3D11Resource> originalResource;
+        original->second->GetResource(originalResource.put());
+
+        m_context->CopyResource(lastHistoryResource.get(), originalResource.get());
+        if(m_requiresHistory > 1)
+        {
+            m_passResources["OriginalHistory1"] = lastHistoryView;
+        }
+    }
+
+    PresentFrame();
+
+    m_renderCounter++;
+    m_prevRenderTicks = GetTickCount64();
+    if(m_prevRenderTicks - m_prevTicks > 1000)
+    {
+        auto deltaTicks     = m_prevRenderTicks - m_prevTicks;
+        auto deltaFrames    = m_renderCounter - m_prevRenderCounter;
+        m_fps               = deltaFrames * 1000.0f / deltaTicks;
+        m_prevRenderCounter = m_renderCounter;
+        m_prevTicks         = m_prevRenderTicks;
+    }
+}
+
+winrt::com_ptr<ID3D11Texture2D> ShaderGlass::GrabOutput()
+{
+    auto                            displayTexture = m_displayTexture;
+    winrt::com_ptr<ID3D11Texture2D> outputTexture;
+
+    if(displayTexture)
+    {
+        D3D11_TEXTURE2D_DESC desc2 = {};
+        displayTexture->GetDesc(&desc2);
+        desc2.Usage          = D3D11_USAGE_DEFAULT;
+        desc2.CPUAccessFlags = 0;
+        desc2.MiscFlags      = 0;
+        auto displayWidth    = desc2.Width;
+        auto displayHeight   = desc2.Height;
+
+        if(m_shaderPasses.size() && (m_boxX != 0 || m_boxY != 0))
+        {
+            const auto& lastPass = m_shaderPasses.rbegin();
+            desc2.Width          = lastPass->m_destWidth;
+            desc2.Height         = lastPass->m_destHeight;
+            hr                   = m_device->CreateTexture2D(&desc2, nullptr, outputTexture.put());
+            assert(SUCCEEDED(hr));
+
+            D3D11_BOX srcBox;
+            srcBox.left   = m_boxX;
+            srcBox.right  = srcBox.left + lastPass->m_destWidth;
+            srcBox.top    = m_boxY;
+            srcBox.bottom = srcBox.top + lastPass->m_destHeight;
+            srcBox.back   = 1;
+            srcBox.front  = 0;
+            // fractions :/
+            if(srcBox.right > displayWidth)
+            {
+                auto adj = srcBox.right - displayWidth;
+                srcBox.left -= adj;
+                srcBox.right -= adj;
+            }
+            if(srcBox.bottom > displayHeight)
+            {
+                auto adj = srcBox.bottom - displayHeight;
+                srcBox.top -= adj;
+                srcBox.bottom -= adj;
+            }
+            m_context->CopySubresourceRegion(outputTexture.get(), 0, 0, 0, 0, displayTexture.get(), 0, &srcBox);
+        }
+        else
+        {
+            hr = m_device->CreateTexture2D(&desc2, nullptr, outputTexture.put());
+            assert(SUCCEEDED(hr));
+
+            m_context->CopyResource(outputTexture.get(), displayTexture.get());
+        }
+    }
+    return outputTexture;
+}
+
+void ShaderGlass::Stop()
+{
+    m_running = false;
 }
