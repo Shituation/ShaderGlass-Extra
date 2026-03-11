@@ -44,8 +44,7 @@ Click to view on YouTube
 
 There are 2 reasons I made this fork: 
 
-1- Games running on SDL have a terrible time with dll injection. Playing mods for old games like Augustus or KeeperFX with 
-shader effects would be impossible.
+1- While DLL injection is superior when available, games running on SDL/SDL2/SDL3 have a terrible time with DLL injection. Playing mods for old games like Augustus or KeeperFX with shader effects would be impossible.
 
 2- The original app had limitations with profiles not saving the states of the window of the app, meaning that for using it
 you had to launch the game, then launch ShaderGlass, then load the profile for the app you want, then move the window in place, then resize its window to fit the game.
